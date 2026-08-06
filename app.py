@@ -342,30 +342,29 @@ def calculate_position_size(price, sl_pct):
     target_price = round(price + (sl_per_share * st.session_state["rr_ratio"]), 2)
     return qty, risk_amt, sl_price, target_price
 
-# Helper: Persistent Signal Timestamp Attacher
+# Helper: Persistent Candle Timestamp Attacher
 def attach_persistent_timestamps(df, tf_label):
-    """Ensures original signal timestamps persist across rescans and page refreshes."""
+    """Retains initial trigger timestamp per signal across refreshes while using true market candle timestamps."""
     if df.empty:
         return df
 
-    now_str = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
-    timestamps = []
+    final_timestamps = []
 
     for _, row in df.iterrows():
-        # Unique Signal Identifier
         sig_key = f"{row['Ticker']}_{row['Signal']}_{tf_label}"
+        candle_ts = row["_RawCandleTime"]
 
+        # Store or reuse timestamp for active signal
         if sig_key in st.session_state["signal_timestamps"]:
-            # Retain original timestamp from initial trigger
             ts = st.session_state["signal_timestamps"][sig_key]
         else:
-            # First time seeing this active signal -> Store timestamp
-            ts = now_str
+            ts = candle_ts
             st.session_state["signal_timestamps"][sig_key] = ts
 
-        timestamps.append(ts)
+        final_timestamps.append(ts)
 
-    df.insert(0, "Signal Timestamp", timestamps)
+    df.insert(0, "Signal Timestamp", final_timestamps)
+    df.drop(columns=["_RawCandleTime"], inplace=True, errors="ignore")
     return df
 
 # ==========================================
@@ -433,6 +432,13 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
             change_pct = float(((curr_price - prev_price) / prev_price) * 100)
             volume = float(df_stock['Volume'].iloc[-1])
 
+            # Extract Actual Candle Timestamp directly from Market Data
+            last_candle_idx = df_stock.index[-1]
+            if hasattr(last_candle_idx, 'strftime'):
+                candle_ts_str = last_candle_idx.strftime("%d-%b-%Y %H:%M:%S")
+            else:
+                candle_ts_str = str(last_candle_idx)
+
             # 1. Technical Indicators Aligned to Active Timeframe
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -490,6 +496,7 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
             )
 
             results.append({
+                "_RawCandleTime": candle_ts_str,
                 "Ticker": sym,
                 "Signal": signal,
                 "Option Strike": strike_label,
