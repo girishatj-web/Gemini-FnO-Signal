@@ -1,6 +1,7 @@
-dhanhq
 streamlit
 pandas
 numpy
-requests
 plotly
+yfinance
+requests
+dhanhq
