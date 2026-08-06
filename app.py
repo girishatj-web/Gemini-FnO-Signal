@@ -11,7 +11,7 @@ import yfinance as yf
 # 1. PAGE CONFIGURATION & LIGHT UI STYLING
 # ==========================================
 st.set_page_config(
-    page_title="Apex Real-Time Intraday SMC Engine",
+    page_title="Apex Multi-Timeframe F&O Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -214,7 +214,6 @@ def validate_dhan_credentials(client_id, access_token):
 
 # REAL DHAN OPTION CHAIN & OPEN INTEREST FEED
 def fetch_dhan_live_option_chain(symbol, client_id, access_token):
-    """Pulls REAL Open Interest (OI) & Volume directly from Dhan Option Chain API."""
     if not client_id or not access_token:
         return None
     
@@ -272,7 +271,7 @@ def send_telegram_alert(message):
     except Exception:
         return False
 
-def dispatch_deduplicated_alerts(filtered_df):
+def dispatch_deduplicated_alerts(filtered_df, tf_label):
     """Triggers Telegram notifications ONLY for BUY CE and BUY PE signals."""
     today_str = datetime.now().strftime("%Y-%m-%d")
     sent_count = 0
@@ -282,19 +281,20 @@ def dispatch_deduplicated_alerts(filtered_df):
         if signal not in ["BUY CE", "BUY PE"]:
             continue
             
-        alert_key = f"{row['Ticker']}_{signal}_{today_str}"
+        alert_key = f"{row['Ticker']}_{signal}_{tf_label}_{today_str}"
         if alert_key not in st.session_state["sent_alerts"]:
             msg = (
-                f"🚨 <b>APEX INTRADAY OPTION SIGNAL</b> 🚨\n\n"
+                f"🚨 <b>APEX OPTION SIGNAL ALERT ({tf_label})</b> 🚨\n\n"
                 f"<b>Symbol:</b> #{row['Ticker']}\n"
+                f"<b>Timeframe:</b> {tf_label}\n"
                 f"<b>Signal:</b> {signal}\n"
                 f"<b>Recommended Strike:</b> {row['Option Strike']}\n"
                 f"<b>Spot Entry:</b> ₹{row['Price (₹)']}\n"
                 f"<b>Stop Loss (SL):</b> ₹{row['Stop Loss (₹)']}\n"
                 f"<b>Target (1:2.5 RR):</b> ₹{row['Target (1:2.5 RR) (₹)']}\n"
                 f"<b>Setup:</b> {row['Setup Description']}\n"
-                f"<b>5m RSI:</b> {row['5m RSI']} | <b>Vol/OI Ratio:</b> {row['Vol/OI Ratio']}\n\n"
-                f"⚡ <i>Apex Live Intraday Feed</i>"
+                f"<b>RSI (14):</b> {row['RSI (14)']} | <b>Vol/OI Ratio:</b> {row['Vol/OI Ratio']}\n\n"
+                f"⚡ <i>Apex Multi-Timeframe Feed</i>"
             )
             if send_telegram_alert(msg):
                 st.session_state["sent_alerts"].add(alert_key)
@@ -339,13 +339,27 @@ def calculate_position_size(price, sl_pct):
     return qty, risk_amt, sl_price, target_price
 
 # ==========================================
-# 4. REAL-TIME 5-MINUTE INTRADAY SCANNING ENGINE
+# 4. MULTI-TIMEFRAME SCANNING ENGINE
 # ==========================================
-@st.cache_data(ttl=60) # Fast 60-second intraday refresh
-def compute_master_signals(symbols, client_id="", access_token=""):
-    """Scans using 5-MINUTE INTRADAY BARS and real Open Interest data."""
+TIMEFRAME_MAP = {
+    "5 Mins": {"interval": "5m", "period": "5d", "label": "5m", "resample": None},
+    "10 Mins": {"interval": "5m", "period": "5d", "label": "10m", "resample": "10min"},
+    "15 Mins": {"interval": "15m", "period": "10d", "label": "15m", "resample": None},
+    "1 Hour": {"interval": "1h", "period": "1mo", "label": "1h", "resample": None},
+    "1 Day": {"interval": "1d", "period": "1y", "label": "1d", "resample": None}
+}
+
+@st.cache_data(ttl=90)
+def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access_token=""):
+    """Scans and computes indicators dynamically aligned to the selected candle timeframe."""
     if not symbols: return pd.DataFrame()
     
+    tf_info = TIMEFRAME_MAP.get(timeframe_key, TIMEFRAME_MAP["5 Mins"])
+    interval = tf_info["interval"]
+    period = tf_info["period"]
+    tf_label = tf_info["label"]
+    resample_rule = tf_info["resample"]
+
     scan_symbols = symbols[:120]
     yf_tickers = []
     for sym in scan_symbols:
@@ -354,8 +368,7 @@ def compute_master_signals(symbols, client_id="", access_token=""):
         else: yf_tickers.append(f"{sym}.NS")
 
     try:
-        # PULLING REAL 5-MINUTE INTRADAY CANDLES
-        data = yf.download(yf_tickers, period="5d", interval="5m", group_by="ticker", progress=False, threads=True)
+        data = yf.download(yf_tickers, period=period, interval=interval, group_by="ticker", progress=False, threads=True)
     except Exception:
         return pd.DataFrame()
 
@@ -369,7 +382,17 @@ def compute_master_signals(symbols, client_id="", access_token=""):
                 if ticker_id not in data.columns.levels[0]: continue
                 df_stock = data[ticker_id].dropna()
 
-            if len(df_stock) < 30: continue
+            if len(df_stock) < 20: continue
+
+            # Apply Custom Resampling (e.g. 10m from 5m ticks)
+            if resample_rule:
+                df_stock = df_stock.resample(resample_rule).agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last',
+                    'Volume': 'sum'
+                }).dropna()
 
             close = df_stock['Close']
             high = df_stock['High']
@@ -380,7 +403,7 @@ def compute_master_signals(symbols, client_id="", access_token=""):
             change_pct = float(((curr_price - prev_price) / prev_price) * 100)
             volume = float(df_stock['Volume'].iloc[-1])
 
-            # 1. Compute 5-Minute Technical Indicators
+            # 1. Technical Indicators Aligned to Active Timeframe
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -390,12 +413,12 @@ def compute_master_signals(symbols, client_id="", access_token=""):
             sma_50 = float(close.rolling(50).mean().iloc[-1]) if len(df_stock) >= 50 else float(close.mean())
             sma_200 = float(close.rolling(200).mean().iloc[-1]) if len(df_stock) >= 200 else sma_50
 
-            # 2. Compute Intraday 5m SMC Engine (PDH/PDL Sweeps & 3-Candle FVG)
-            pdh = float(high.iloc[:-1].max())
-            pdl = float(low.iloc[:-1].min())
+            # 2. SMC Engine Aligned to Active Timeframe Candles
+            prev_high_level = float(high.iloc[:-1].max())
+            prev_low_level = float(low.iloc[:-1].min())
 
-            is_high_sweep = float(high.iloc[-1]) > pdh and curr_price < pdh
-            is_low_sweep = float(low.iloc[-1]) < pdl and curr_price > pdl
+            is_high_sweep = float(high.iloc[-1]) > prev_high_level and curr_price < prev_high_level
+            is_low_sweep = float(low.iloc[-1]) < prev_low_level and curr_price > prev_low_level
 
             c1_high = float(high.iloc[-3])
             c3_low = float(low.iloc[-1])
@@ -405,7 +428,7 @@ def compute_master_signals(symbols, client_id="", access_token=""):
             bullish_fvg = c3_low > c1_high
             bearish_fvg = c3_high < c1_low
 
-            # 3. Pull REAL Dhan Option Chain Vol/OI Feed (or Real Intraday Vol/OI)
+            # 3. Pull Real Dhan Option Chain Feed or Dynamic Volume Velocity
             real_vol_oi = fetch_dhan_live_option_chain(sym, client_id, access_token)
             if real_vol_oi is None:
                 total_vol_series = df_stock['Volume'].tail(14).sum()
@@ -415,22 +438,22 @@ def compute_master_signals(symbols, client_id="", access_token=""):
             # Signal Classifier Logic
             if is_low_sweep or (bullish_fvg and real_vol_oi > 1.5):
                 signal = "BUY CE"
-                setup_desc = "5m Liquidity Sweep / Bullish FVG Retest"
+                setup_desc = f"{tf_label} Liquidity Sweep / Bullish FVG"
             elif is_high_sweep or (bearish_fvg and real_vol_oi > 1.5):
                 signal = "BUY PE"
-                setup_desc = "5m PDH Sweep / Bearish FVG Retest"
+                setup_desc = f"{tf_label} Sweep / Bearish FVG"
             elif rsi_14 < 35 and curr_price > sma_50:
                 signal = "Bullish Oversold"
-                setup_desc = "Oversold 5m RSI + Above 50 SMA"
+                setup_desc = f"Oversold {tf_label} RSI + Above 50 SMA"
             elif curr_price > sma_50 and sma_50 > sma_200:
                 signal = "Strong Uptrend"
-                setup_desc = "Intraday Trend Alignment (50 > 200 SMA)"
+                setup_desc = f"{tf_label} Trend Alignment (50 > 200 SMA)"
             elif curr_price < sma_50 and curr_price < sma_200:
                 signal = "Downtrend Breakdown"
-                setup_desc = "Below Intraday Moving Averages"
+                setup_desc = f"Below {tf_label} Moving Averages"
             else:
                 signal = "Consolidating"
-                setup_desc = "Rangebound Intraday Action"
+                setup_desc = f"Rangebound {tf_label} Action"
 
             strike_label, sl_price, target_price = get_option_strike_params(
                 sym, curr_price, signal, st.session_state["default_sl_pct"], st.session_state["rr_ratio"]
@@ -444,10 +467,10 @@ def compute_master_signals(symbols, client_id="", access_token=""):
                 "Stop Loss (₹)": sl_price,
                 "Target (1:2.5 RR) (₹)": target_price,
                 "Change (%)": round(change_pct, 2),
-                "5m RSI": round(rsi_14, 1),
+                "RSI (14)": round(rsi_14, 1),
                 "Vol/OI Ratio": real_vol_oi,
                 "Setup Description": setup_desc,
-                "5m Volume": int(volume)
+                "Candle Volume": int(volume)
             })
         except Exception:
             continue
@@ -461,7 +484,7 @@ fno_universe = fetch_dhan_fno_universe()
 # ==========================================
 with st.sidebar:
     st.markdown("### ⚡ Apex Algo Control Center")
-    st.caption(f"Intraday 5m Engine: **{len(fno_universe)}** Active Equities")
+    st.caption(f"Clean Equity Universe: **{len(fno_universe)}** Equities")
     st.divider()
 
     dhan_status_class = "status-badge-active" if st.session_state["dhan_authenticated"] else "status-badge-off"
@@ -474,22 +497,31 @@ with st.sidebar:
     st.markdown(f"**Telegram Bot:** <span class='{tg_status_class}'>{tg_status_text}</span>", unsafe_allow_html=True)
     st.divider()
 
+    st.markdown("#### ⏱️ Candle Timeframe")
+    selected_timeframe = st.selectbox(
+        "Select Candle Duration", 
+        ["5 Mins", "10 Mins", "15 Mins", "1 Hour", "1 Day"], 
+        index=0
+    )
+    st.divider()
+
     st.markdown("#### 🔍 Filter Criteria")
     selected_signal = st.selectbox("Signal Classifier", ["BUY CE & PE Only", "BUY CE", "BUY PE", "All Signals", "Bullish Oversold", "Strong Uptrend", "Downtrend Breakdown", "Consolidating"], index=0)
     min_vol_oi = st.slider("Min Vol/OI Ratio Threshold", 0.5, 3.0, 1.0, 0.1)
-    rsi_range = st.slider("5m RSI Range", 0.0, 100.0, (0.0, 100.0))
+    rsi_range = st.slider(f"{selected_timeframe} RSI Range", 0.0, 100.0, (0.0, 100.0))
     search_ticker = st.text_input("Find Symbol", "").upper().strip()
 
     st.divider()
-    if st.button("🔄 Rescan 5m Market Feed", use_container_width=True):
+    if st.button("🔄 Rescan Selected Timeframe", use_container_width=True):
         st.cache_data.clear()
         st.session_state["last_scan_time"] = datetime.now().strftime("%H:%M:%S")
         st.rerun()
 
-# Run 5m Intraday Screener
-with st.spinner("Processing 5-Minute Intraday Feed & Dhan Option Chain..."):
+# Run Multi-Timeframe Screener
+with st.spinner(f"Computing {selected_timeframe} Candles, SMC Signals & Dhan Option Chain..."):
     df_screener = compute_master_signals(
         fno_universe, 
+        selected_timeframe,
         st.session_state["dhan_client_id"], 
         st.session_state["dhan_access_token"]
     )
@@ -504,23 +536,23 @@ if not filtered_df.empty:
 
     filtered_df = filtered_df[
         (filtered_df["Vol/OI Ratio"] >= min_vol_oi) &
-        (filtered_df["5m RSI"] >= rsi_range[0]) & 
-        (filtered_df["5m RSI"] <= rsi_range[1])
+        (filtered_df["RSI (14)"] >= rsi_range[0]) & 
+        (filtered_df["RSI (14)"] <= rsi_range[1])
     ]
     if search_ticker:
         filtered_df = filtered_df[filtered_df["Ticker"].str.contains(search_ticker)]
 
 # Dispatch Telegram Alerts (Strictly BUY CE & BUY PE)
 if st.session_state["tg_connected"] and not filtered_df.empty:
-    dispatch_deduplicated_alerts(filtered_df)
+    dispatch_deduplicated_alerts(filtered_df, TIMEFRAME_MAP[selected_timeframe]["label"])
 
 # ==========================================
 # 6. MAIN DASHBOARD PANELS
 # ==========================================
-st.title("⚡ Apex Real-Time 5m Intraday Option Dashboard")
+st.title(f"⚡ Apex Real-Time Dashboard ({selected_timeframe} Timeframe)")
 
 tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders = st.tabs([
-    "📋 Live 5m Screener", 
+    "📋 Live Screener", 
     "📑 Institutional Journal", 
     "🔑 Dhan API & Auth", 
     "📱 Telegram Center", 
@@ -533,16 +565,16 @@ tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders 
 # TAB 1: SCREENER & ORDER TERMINAL
 # ------------------------------------------------------------------
 with tab_screener:
-    st.subheader("Real-Time 5-Minute Intraday Signals & Execution Terminal")
+    st.subheader(f"Real-Time Option Signals & Execution ({selected_timeframe} Candles)")
 
     k1, k2, k3, k4 = st.columns(4)
     total_m = len(filtered_df)
     bullish_m = len(filtered_df[filtered_df["Signal"].str.contains("BUY CE|Bullish|Uptrend")]) if total_m > 0 else 0
-    avg_rsi = round(filtered_df["5m RSI"].mean(), 1) if total_m > 0 else 0
+    avg_rsi = round(filtered_df["RSI (14)"].mean(), 1) if total_m > 0 else 0
     
     with k1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Filtered Matches</div><div class='kpi-value'>{total_m}</div></div>", unsafe_allow_html=True)
     with k2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Bullish Setups</div><div class='kpi-value'>{bullish_m}</div></div>", unsafe_allow_html=True)
-    with k3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Avg 5m RSI</div><div class='kpi-value'>{avg_rsi}</div></div>", unsafe_allow_html=True)
+    with k3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Avg {selected_timeframe} RSI</div><div class='kpi-value'>{avg_rsi}</div></div>", unsafe_allow_html=True)
     with k4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Telegram Alerts Sent</div><div class='kpi-value'>{len(st.session_state['sent_alerts'])}</div></div>", unsafe_allow_html=True)
 
     st.divider()
@@ -550,7 +582,7 @@ with tab_screener:
     col_table, col_action = st.columns([2, 1])
 
     with col_table:
-        st.markdown("##### Filtered 5-Minute Option Signal Directory")
+        st.markdown(f"##### Filtered Option Signal Directory ({selected_timeframe})")
         if not filtered_df.empty:
             st.dataframe(
                 filtered_df.style.format({
@@ -558,9 +590,9 @@ with tab_screener:
                     "Stop Loss (₹)": "₹{:.2f}",
                     "Target (1:2.5 RR) (₹)": "₹{:.2f}",
                     "Change (%)": "{:+.2f}%",
-                    "5m RSI": "{:.1f}",
+                    "RSI (14)": "{:.1f}",
                     "Vol/OI Ratio": "{:.2f}",
-                    "5m Volume": "{:,.0f}"
+                    "Candle Volume": "{:,.0f}"
                 }).map(
                     lambda x: 'color: #16A34A; font-weight: 700;' if isinstance(x, (int, float)) and x > 0 else ('color: #DC2626; font-weight: 700;' if isinstance(x, (int, float)) and x < 0 else ''),
                     subset=["Change (%)"]
@@ -569,7 +601,7 @@ with tab_screener:
                 height=450
             )
         else:
-            st.info("No intraday 5m signals match criteria. Adjust filters or click Rescan.")
+            st.info(f"No signals match criteria for {selected_timeframe}. Adjust sidebar filters or click Rescan.")
 
     with col_action:
         st.markdown("##### ⚡ Order Execution Panel")
@@ -588,7 +620,7 @@ with tab_screener:
             
             qty, risk_amt, _, _ = calculate_position_size(price, st.session_state["default_sl_pct"])
 
-            st.success(f"**Target:** {selected_stock} | **Signal:** {signal}")
+            st.success(f"**Target:** {selected_stock} | **Signal:** {signal} ({selected_timeframe})")
             st.write(f"• **Recommended Strike:** `{strike}`")
             st.write(f"• **Spot Entry Price:** ₹{price}")
             st.write(f"• **Stop Loss (SL):** ₹{sl}")
@@ -603,6 +635,7 @@ with tab_screener:
                 if st.button("📄 Paper Trade", use_container_width=True):
                     paper_entry = {
                         "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Timeframe": selected_timeframe,
                         "Symbol": selected_stock,
                         "Strike": strike,
                         "Type": signal,
@@ -625,6 +658,7 @@ with tab_screener:
                             live_entry = {
                                 "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "OrderID": order_info,
+                                "Timeframe": selected_timeframe,
                                 "Symbol": selected_stock,
                                 "Strike": strike,
                                 "Type": signal,
@@ -645,7 +679,7 @@ with tab_screener:
 # ------------------------------------------------------------------
 with tab_journal:
     st.subheader("📑 Institutional Trade Journal & Performance Analytics")
-    st.caption("Multi-timeframe 5-minute FVG & SMC executions with $1:2.5$ Risk-to-Reward ratio outcomes.")
+    st.caption("Multi-timeframe FVG & SMC executions with $1:2.5$ Risk-to-Reward ratio outcomes.")
 
     df_journal = pd.DataFrame(st.session_state["institutional_journal"])
     
@@ -697,7 +731,7 @@ with tab_dhan:
 # ------------------------------------------------------------------
 with tab_tg:
     st.subheader("📱 Telegram Notification Engine")
-    st.caption("Broadcasts alerts exclusively for BUY CE and BUY PE signals.")
+    st.caption("Broadcasts alerts exclusively for BUY CE and BUY PE signals across selected timeframes.")
 
     col_tg_cfg, col_tg_test = st.columns([2, 1])
 
@@ -720,7 +754,7 @@ with tab_tg:
             if not st.session_state["tg_connected"]:
                 st.error("Configure Bot Token & Chat ID first.")
             else:
-                ok = send_telegram_alert("✅ <b>Apex Algo:</b> Telegram Alert System Active!")
+                ok = send_telegram_alert(f"✅ <b>Apex Algo:</b> Telegram Alert System Active! Active Timeframe: {selected_timeframe}")
                 if ok: st.success("Test Delivered!")
                 else: st.error("Delivery Failed.")
 
