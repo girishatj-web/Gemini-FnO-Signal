@@ -9,8 +9,6 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
 
 # ==========================================
 # 1. DATABASE & PERSISTENT CONFIG STORE
@@ -346,8 +344,8 @@ def run_smc_analysis(dhan, symbol, meta_info, interval_5m, capital, max_risk_pct
 st.set_page_config(page_title="SMC Options Terminal Pro", layout="wide", initial_sidebar_state="expanded")
 
 # Persistent Settings Load
-saved_client_id = get_config("dhan_client_id", st.secrets.get("DHAN_CLIENT_ID", ""))
-saved_access_token = get_config("dhan_access_token", st.secrets.get("DHAN_ACCESS_TOKEN", ""))
+saved_client_id = get_config("dhan_client_id", "")
+saved_access_token = get_config("dhan_access_token", "")
 saved_bot_token = get_config("telegram_bot_token", "")
 saved_chat_id = get_config("telegram_chat_id", "")
 
@@ -561,17 +559,20 @@ with tab_journal:
         m3.metric("Total Trades Logged", total_trades)
         m4.metric("Profit Factor", f"{round(abs(df_j[df_j['pnl']>0]['pnl'].sum() / (df_j[df_j['pnl']<=0]['pnl'].sum() or 1)), 2)}")
 
-        # Analytics Charts
+        # Analytics Charts using Streamlit Native Charting
         col_g1, col_g2 = st.columns(2)
         with col_g1:
-            fig_curve = px.line(df_j, x='timestamp', y='cumulative_pnl', title="📈 Cumulative Equity Curve (₹)", markers=True)
-            fig_curve.update_traces(line_color="#2ea043", line_width=3)
-            st.plotly_chart(fig_curve, use_container_width=True)
+            st.markdown("##### 📈 Cumulative Equity Curve (₹)")
+            chart_df = df_j.set_index("timestamp")[["cumulative_pnl"]]
+            st.line_chart(chart_df, color="#2ea043")
 
         with col_g2:
-            fig_pie = px.pie(names=["Winning Trades 🎯", "Losing Trades ❌"], values=[wins, losses], 
-                             title="🎯 Win/Loss Distribution", color_discrete_sequence=["#2ea043", "#da3633"])
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.markdown("##### 🎯 Win vs Loss Count")
+            wl_df = pd.DataFrame(
+                {"Trades": [wins, losses]},
+                index=["Winning Trades 🎯", "Losing Trades ❌"]
+            )
+            st.bar_chart(wl_df, color="#2ea043")
 
         st.markdown("##### 📖 Complete Journal Logs")
         st.dataframe(df_j.sort_values(by="timestamp", ascending=False), use_container_width=True)
