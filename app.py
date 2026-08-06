@@ -1,15 +1,3 @@
-import sys
-import subprocess
-
-# --- AUTOMATIC FALLBACK PACKAGE INSTALLER ---
-try:
-    from dhanhq import dhanhq
-except ModuleNotFoundError:
-    st_msg = "Installing required packages (dhanhq)... Please wait."
-    print(st_msg)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "dhanhq", "pandas", "numpy", "requests"])
-    from dhanhq import dhanhq
-
 import concurrent.futures
 import datetime
 import math
@@ -18,6 +6,8 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from dhanhq import dhanhq
+
 # ==========================================
 # 1. DATABASE INITIALIZATION (SQLite)
 # ==========================================
