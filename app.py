@@ -1,18 +1,17 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-import yfinance as yf
 import requests
 import re
 import time
 from datetime import datetime
+import yfinance as yf
 
 # ==========================================
 # 1. PAGE CONFIGURATION & LIGHT UI STYLING
 # ==========================================
 st.set_page_config(
-    page_title="Apex Institutional SMC & Algo Engine",
+    page_title="Apex Institutional F&O Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -139,7 +138,6 @@ def init_session_state():
     if "total_capital" not in st.session_state: st.session_state["total_capital"] = 200000.0
     if "risk_per_trade_pct" not in st.session_state: st.session_state["risk_per_trade_pct"] = 1.0
     if "default_sl_pct" not in st.session_state: st.session_state["default_sl_pct"] = 1.5
-    if "default_target_pct" not in st.session_state: st.session_state["default_target_pct"] = 3.75
     if "rr_ratio" not in st.session_state: st.session_state["rr_ratio"] = 2.5
 
     if "auto_scan_active" not in st.session_state: st.session_state["auto_scan_active"] = False
@@ -148,10 +146,10 @@ def init_session_state():
 
     if "institutional_journal" not in st.session_state: 
         st.session_state["institutional_journal"] = [
-            {"Date / Time": "Aug 5 (Morning Session)", "Symbol": "NIFTY", "Signal": "BUY CE", "Entry Price": 24180.0, "Stop Loss": 24140.0, "Target (1:2.5 RR)": 24280.0, "Outcome": "TARGET HIT 🎯"},
-            {"Date / Time": "Aug 5 (Afternoon Session)", "Symbol": "BANKNIFTY", "Signal": "BUY PE", "Entry Price": 51450.0, "Stop Loss": 51600.0, "Target (1:2.5 RR)": 51075.0, "Outcome": "STOP LOSS HIT ❌"},
-            {"Date / Time": "Aug 6 (Opening Range)", "Symbol": "NIFTY", "Signal": "BUY CE", "Entry Price": 24220.0, "Stop Loss": 24180.0, "Target (1:2.5 RR)": 24320.0, "Outcome": "TARGET HIT 🎯"},
-            {"Date / Time": "Aug 6 (Midday Retest)", "Symbol": "RELIANCE", "Signal": "BUY PE", "Entry Price": 2980.0, "Stop Loss": 2995.0, "Target (1:2.5 RR)": 2942.0, "Outcome": "TARGET HIT 🎯"},
+            {"Date / Time": "Aug 5 (Morning Session)", "Symbol": "NIFTY", "Signal": "BUY CE", "Option Strike": "NIFTY 24200 CE", "Entry Price": 24180.0, "Stop Loss": 24140.0, "Target (1:2.5 RR)": 24280.0, "Outcome": "TARGET HIT 🎯"},
+            {"Date / Time": "Aug 5 (Afternoon Session)", "Symbol": "BANKNIFTY", "Signal": "BUY PE", "Option Strike": "BANKNIFTY 51500 PE", "Entry Price": 51450.0, "Stop Loss": 51600.0, "Target (1:2.5 RR)": 51075.0, "Outcome": "STOP LOSS HIT ❌"},
+            {"Date / Time": "Aug 6 (Opening Range)", "Symbol": "NIFTY", "Signal": "BUY CE", "Option Strike": "NIFTY 24200 CE", "Entry Price": 24220.0, "Stop Loss": 24180.0, "Target (1:2.5 RR)": 24320.0, "Outcome": "TARGET HIT 🎯"},
+            {"Date / Time": "Aug 6 (Midday Retest)", "Symbol": "RELIANCE", "Signal": "BUY PE", "Option Strike": "RELIANCE 2980 PE", "Entry Price": 2980.0, "Stop Loss": 2995.0, "Target (1:2.5 RR)": 2942.0, "Outcome": "TARGET HIT 🎯"},
         ]
 
     if "paper_trade_log" not in st.session_state: st.session_state["paper_trade_log"] = []
@@ -162,8 +160,7 @@ init_session_state()
 # Fallback Standard Liquid F&O Universe
 NSE_FNO_FALLBACK = [
     "NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "TATAMOTORS",
-    "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL",
-    "NTPC", "POWERGRID", "TITAN", "ASIANPAINT", "ONGC", "HAL", "ADANIENT", "ADANIPORTS", "COALINDIA", "JIOFIN"
+    "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL"
 ]
 
 # ==========================================
@@ -173,7 +170,6 @@ DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 @st.cache_data(ttl=3600*12)
 def fetch_dhan_fno_universe():
-    """Parses Dhan Scrip Master and strips derivative suffixes to return pure stock equity symbols."""
     try:
         df_master = pd.read_csv(DHAN_SCRIP_MASTER_URL, low_memory=False)
         fno_mask = (
@@ -191,7 +187,6 @@ def fetch_dhan_fno_universe():
         indices = {'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT50'}
         clean_symbols = set(["NIFTY", "BANKNIFTY"])
         
-        # Regex to clean option contract suffixes (e.g. ADANIENTAUGCALL -> ADANIENT)
         months_regex = r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|CALL|PUT|FUT|CE|PE|\d+).*$'
 
         for raw_sym in raw_symbols:
@@ -255,16 +250,68 @@ def send_telegram_alert(message):
         return False
 
 def dispatch_deduplicated_alerts(filtered_df):
+    """FILTERED ALERT ENGINE: Strictly triggers Telegram alerts ONLY for BUY CE & BUY PE signals."""
     today_str = datetime.now().strftime("%Y-%m-%d")
     sent_count = 0
+    
     for _, row in filtered_df.iterrows():
-        alert_key = f"{row['Ticker']}_{row['Signal']}_{today_str}"
+        signal = str(row['Signal']).upper().strip()
+        
+        # STRICT TRIGGER FILTER: Only send alerts for BUY CE or BUY PE
+        if signal not in ["BUY CE", "BUY PE"]:
+            continue
+            
+        alert_key = f"{row['Ticker']}_{signal}_{today_str}"
         if alert_key not in st.session_state["sent_alerts"]:
-            msg = f"🚨 <b>APEX SIGNAL: #{row['Ticker']}</b>\nSignal: {row['Signal']}\nPrice: ₹{row['Price (₹)']}\nRSI (14): {row['RSI (14)']}\nVol/OI: {row['Vol/OI Ratio']}\nSetup: {row['Setup Description']}"
+            msg = (
+                f"🚨 <b>APEX OPTION SIGNAL ALERT</b> 🚨\n\n"
+                f"<b>Symbol:</b> #{row['Ticker']}\n"
+                f"<b>Signal:</b> {signal}\n"
+                f"<b>Option Strike:</b> {row['Option Strike']}\n"
+                f"<b>Spot Entry:</b> ₹{row['Price (₹)']}\n"
+                f"<b>Stop Loss (SL):</b> ₹{row['Stop Loss (₹)']}\n"
+                f"<b>Target (1:2.5 RR):</b> ₹{row['Target (1:2.5 RR) (₹)']}\n"
+                f"<b>Setup:</b> {row['Setup Description']}\n"
+                f"<b>RSI (14):</b> {row['RSI (14)']} | <b>Vol/OI Ratio:</b> {row['Vol/OI Ratio']}\n\n"
+                f"⚡ <i>Apex Institutional Engine</i>"
+            )
             if send_telegram_alert(msg):
                 st.session_state["sent_alerts"].add(alert_key)
                 sent_count += 1
     return sent_count
+
+# Helper: Dynamic Option Strike, SL & Target Calculator
+def get_option_strike_params(symbol, price, signal, sl_pct=1.5, rr_ratio=2.5):
+    if signal not in ["BUY CE", "BUY PE"]:
+        return "N/A", round(price * 0.985, 2), round(price * 1.0375, 2)
+
+    # Dynamic Strike Interval Logic
+    if symbol == "NIFTY":
+        step = 50
+    elif symbol == "BANKNIFTY":
+        step = 100
+    elif price > 3000:
+        step = 100
+    elif price > 1000:
+        step = 20
+    elif price > 500:
+        step = 10
+    else:
+        step = 5
+
+    atm_strike = int(round(price / step) * step)
+    option_type = "CE" if "CE" in signal else "PE"
+    strike_label = f"{symbol} {atm_strike} {option_type}"
+
+    sl_dist = price * (sl_pct / 100.0)
+    if "CE" in signal:
+        sl_price = round(price - sl_dist, 2)
+        target_price = round(price + (sl_dist * rr_ratio), 2)
+    else:
+        sl_price = round(price + sl_dist, 2)
+        target_price = round(price - (sl_dist * rr_ratio), 2)
+
+    return strike_label, sl_price, target_price
 
 # Position Risk Calculator
 def calculate_position_size(price, sl_pct):
@@ -279,14 +326,13 @@ def calculate_position_size(price, sl_pct):
     return qty, risk_amt, sl_price, target_price
 
 # ==========================================
-# 4. MASTER SCREENING ENGINE (WITH RATE-LIMIT PROTECTION)
+# 4. MASTER SCREENING ENGINE
 # ==========================================
 @st.cache_data(ttl=300)
 def compute_master_signals(symbols):
     if not symbols: return pd.DataFrame()
     
-    # Restrict to active clean stock universe (~150 liquid equities max)
-    scan_symbols = symbols[:150]
+    scan_symbols = symbols[:120]
     yf_tickers = []
     for sym in scan_symbols:
         if sym == "NIFTY": yf_tickers.append("^NSEI")
@@ -364,20 +410,23 @@ def compute_master_signals(symbols):
                 signal = "Consolidating"
                 setup_desc = "Rangebound Price Action"
 
+            # Compute Strike, SL, and Target Parameters
+            strike_label, sl_price, target_price = get_option_strike_params(
+                sym, curr_price, signal, st.session_state["default_sl_pct"], st.session_state["rr_ratio"]
+            )
+
             results.append({
                 "Ticker": sym,
+                "Signal": signal,
+                "Option Strike": strike_label,
                 "Price (₹)": round(curr_price, 2),
+                "Stop Loss (₹)": sl_price,
+                "Target (1:2.5 RR) (₹)": target_price,
                 "Change (%)": round(change_pct, 2),
                 "RSI (14)": round(rsi_14, 1),
-                "SMA 50 (₹)": round(sma_50, 2),
-                "SMA 200 (₹)": round(sma_200, 2),
                 "Vol/OI Ratio": vol_oi_ratio,
-                "IV (%)": iv_spike,
-                "Volume": int(volume),
-                "Signal": signal,
                 "Setup Description": setup_desc,
-                "PDH Sweep": "YES 🚨" if is_high_sweep else "NO",
-                "PDL Sweep": "YES 🚨" if is_low_sweep else "NO"
+                "Volume": int(volume)
             })
         except Exception:
             continue
@@ -405,7 +454,7 @@ with st.sidebar:
     st.divider()
 
     st.markdown("#### 🔍 Filter Criteria")
-    selected_signal = st.selectbox("Signal Classifier", ["All Signals", "BUY CE", "BUY PE", "Bullish Oversold", "Strong Uptrend", "Downtrend Breakdown", "Consolidating"], index=0)
+    selected_signal = st.selectbox("Signal Classifier", ["BUY CE & PE Only", "BUY CE", "BUY PE", "All Signals", "Bullish Oversold", "Strong Uptrend", "Downtrend Breakdown", "Consolidating"], index=0)
     min_vol_oi = st.slider("Min Vol/OI Ratio Threshold", 1.0, 3.0, 1.0, 0.1)
     rsi_range = st.slider("RSI (14) Range", 0.0, 100.0, (0.0, 100.0))
     search_ticker = st.text_input("Find Symbol", "").upper().strip()
@@ -423,8 +472,11 @@ with st.spinner("Executing Master Technical, SMC & Option Velocity Scanner..."):
 filtered_df = df_screener.copy()
 
 if not filtered_df.empty:
-    if selected_signal != "All Signals":
+    if selected_signal == "BUY CE & PE Only":
+        filtered_df = filtered_df[filtered_df["Signal"].isin(["BUY CE", "BUY PE"])]
+    elif selected_signal != "All Signals":
         filtered_df = filtered_df[filtered_df["Signal"] == selected_signal]
+
     filtered_df = filtered_df[
         (filtered_df["Vol/OI Ratio"] >= min_vol_oi) &
         (filtered_df["RSI (14)"] >= rsi_range[0]) & 
@@ -433,6 +485,7 @@ if not filtered_df.empty:
     if search_ticker:
         filtered_df = filtered_df[filtered_df["Ticker"].str.contains(search_ticker)]
 
+# Dispatch Telegram Alerts (Only for BUY CE / BUY PE)
 if st.session_state["tg_connected"] and not filtered_df.empty:
     dispatch_deduplicated_alerts(filtered_df)
 
@@ -441,9 +494,8 @@ if st.session_state["tg_connected"] and not filtered_df.empty:
 # ==========================================
 st.title("⚡ Apex Enterprise Algo & Screener Dashboard")
 
-tab_screener, tab_chart, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders = st.tabs([
+tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders = st.tabs([
     "📋 Live Screener", 
-    "📊 Plotly Chart", 
     "📑 Institutional Journal", 
     "🔑 Dhan API & Auth", 
     "📱 Telegram Center", 
@@ -466,22 +518,22 @@ with tab_screener:
     with k1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Filtered Matches</div><div class='kpi-value'>{total_m}</div></div>", unsafe_allow_html=True)
     with k2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Bullish Setups</div><div class='kpi-value'>{bullish_m}</div></div>", unsafe_allow_html=True)
     with k3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Avg RSI</div><div class='kpi-value'>{avg_rsi}</div></div>", unsafe_allow_html=True)
-    with k4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Unique Alerts</div><div class='kpi-value'>{len(st.session_state['sent_alerts'])}</div></div>", unsafe_allow_html=True)
+    with k4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Telegram Alerts Sent</div><div class='kpi-value'>{len(st.session_state['sent_alerts'])}</div></div>", unsafe_allow_html=True)
 
     st.divider()
 
     col_table, col_action = st.columns([2, 1])
 
     with col_table:
-        st.markdown("##### Filtered Asset Directory")
+        st.markdown("##### Filtered Option Signal Directory")
         if not filtered_df.empty:
             st.dataframe(
                 filtered_df.style.format({
                     "Price (₹)": "₹{:.2f}",
+                    "Stop Loss (₹)": "₹{:.2f}",
+                    "Target (1:2.5 RR) (₹)": "₹{:.2f}",
                     "Change (%)": "{:+.2f}%",
                     "RSI (14)": "{:.1f}",
-                    "SMA 50 (₹)": "₹{:.2f}",
-                    "SMA 200 (₹)": "₹{:.2f}",
                     "Vol/OI Ratio": "{:.2f}",
                     "Volume": "{:,.0f}"
                 }).map(
@@ -492,11 +544,11 @@ with tab_screener:
                 height=450
             )
         else:
-            st.info("No assets match current criteria. Adjust sidebar filters or click Rescan.")
+            st.info("No option signals match current criteria. Adjust sidebar filters or click Rescan.")
 
     with col_action:
         st.markdown("##### ⚡ Order Execution Panel")
-        selectable_stocks = filtered_df["Ticker"].unique() if not filtered_df.empty else df_screener["Ticker"].unique() if not df_screener.empty else []
+        selectable_stocks = filtered_df["Ticker"].unique() if not filtered_df.empty else (df_screener["Ticker"].unique() if not df_screener.empty else [])
         
         if len(selectable_stocks) > 0:
             selected_stock = st.selectbox("Target Asset", selectable_stocks)
@@ -504,15 +556,20 @@ with tab_screener:
             ref_df = filtered_df if not filtered_df.empty else df_screener
             stock_row = ref_df[ref_df["Ticker"] == selected_stock].iloc[0]
             price = float(stock_row["Price (₹)"])
+            signal = str(stock_row["Signal"])
+            strike = str(stock_row["Option Strike"])
+            sl = float(stock_row["Stop Loss (₹)"])
+            target = float(stock_row["Target (1:2.5 RR) (₹)"])
             
-            qty, risk_amt, sl_price, target_price = calculate_position_size(price, st.session_state["default_sl_pct"])
+            qty, risk_amt, _, _ = calculate_position_size(price, st.session_state["default_sl_pct"])
 
-            st.success(f"**Selected Asset:** {selected_stock} | **LTP:** ₹{price}")
+            st.success(f"**Target:** {selected_stock} | **Signal:** {signal}")
+            st.write(f"• **Recommended Strike:** `{strike}`")
+            st.write(f"• **Spot Entry Price:** ₹{price}")
+            st.write(f"• **Stop Loss (SL):** ₹{sl}")
+            st.write(f"• **Target (1:2.5 RR):** ₹{target}")
             st.write(f"• **Position Size:** `{qty}` Shares")
-            st.write(f"• **Capital at Risk:** ₹{risk_amt:,.2f}")
-            st.write(f"• **Stop Loss:** ₹{sl_price} ({st.session_state['default_sl_pct']}%)")
-            st.write(f"• **Target (1:2.5 RR):** ₹{target_price}")
-            st.write(f"• **Setup:** {stock_row['Setup Description']}")
+            st.write(f"• **Capital Risk:** ₹{risk_amt:,.2f}")
 
             st.write("")
             col_p, col_l = st.columns(2)
@@ -522,20 +579,21 @@ with tab_screener:
                     paper_entry = {
                         "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "Symbol": selected_stock,
-                        "Type": "BUY",
+                        "Strike": strike,
+                        "Type": signal,
                         "Qty": qty,
                         "Entry Price": price,
-                        "SL": sl_price,
-                        "Target": target_price,
+                        "SL": sl,
+                        "Target": target,
                         "Status": "OPEN"
                     }
                     st.session_state["paper_trade_log"].append(paper_entry)
-                    st.success(f"Paper Order Placed for {selected_stock}!")
+                    st.success(f"Paper Order Placed for {strike}!")
 
             with col_l:
                 if st.button("🚀 1-Click Live Trade", use_container_width=True, type="primary"):
                     if not st.session_state["dhan_authenticated"]:
-                        st.error("Authenticate Dhan API in Tab 4 first!")
+                        st.error("Authenticate Dhan API in Tab 3 first!")
                     else:
                         success, order_info = execute_dhan_live_order(selected_stock, qty, "BUY", price)
                         if success:
@@ -543,7 +601,8 @@ with tab_screener:
                                 "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "OrderID": order_info,
                                 "Symbol": selected_stock,
-                                "Type": "BUY",
+                                "Strike": strike,
+                                "Type": signal,
                                 "Qty": qty,
                                 "Price": price,
                                 "Status": "EXECUTED"
@@ -557,50 +616,7 @@ with tab_screener:
             st.warning("Loading market data...")
 
 # ------------------------------------------------------------------
-# TAB 2: INTERACTIVE PLOTLY CANDLESTICK CHART
-# ------------------------------------------------------------------
-with tab_chart:
-    st.subheader("📊 Interactive Candlestick Analysis")
-    
-    chart_symbols = filtered_df["Ticker"].unique() if not filtered_df.empty else (df_screener["Ticker"].unique() if not df_screener.empty else fno_universe)
-    chart_stock = st.selectbox("Select Asset for Detailed Candlestick Plot", chart_symbols)
-
-    if chart_stock:
-        ticker_id = "^NSEI" if chart_stock == "NIFTY" else ("^NSEBANK" if chart_stock == "BANKNIFTY" else f"{chart_stock}.NS")
-        
-        try:
-            stock_data = yf.Ticker(ticker_id).history(period="6m")
-            
-            if not stock_data.empty:
-                stock_data['SMA50'] = stock_data['Close'].rolling(50).mean()
-                stock_data['SMA200'] = stock_data['Close'].rolling(200).mean()
-
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(
-                    x=stock_data.index,
-                    open=stock_data['Open'], high=stock_data['High'],
-                    low=stock_data['Low'], close=stock_data['Close'],
-                    name="Price"
-                ))
-                fig.add_trace(go.Scatter(x=stock_data.index, y=stock_data['SMA50'], mode='lines', name='50 SMA', line=dict(color='#2563EB', width=2)))
-                fig.add_trace(go.Scatter(x=stock_data.index, y=stock_data['SMA200'], mode='lines', name='200 SMA', line=dict(color='#D97706', width=2)))
-
-                fig.update_layout(
-                    template="plotly_white",
-                    paper_bgcolor="#FFFFFF",
-                    plot_bgcolor="#FFFFFF",
-                    margin=dict(l=20, r=20, t=30, b=20),
-                    height=500,
-                    xaxis_rangeslider_visible=False
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning(f"No price history found for ticker: {ticker_id}")
-        except Exception as e:
-            st.warning("Yahoo Finance rate limit reached for live chart pings. Please wait a moment and click Rescan.")
-
-# ------------------------------------------------------------------
-# TAB 3: INSTITUTIONAL JOURNAL & BACKTEST PERFORMANCE
+# TAB 2: INSTITUTIONAL JOURNAL & BACKTEST PERFORMANCE
 # ------------------------------------------------------------------
 with tab_journal:
     st.subheader("📑 Institutional Trade Journal & Performance Analytics")
@@ -628,7 +644,7 @@ with tab_journal:
         with m3: st.metric("Profit Factor (at 1:2.5 RR)", f"{round((wins * 2.5) / (max(1, total - wins)), 2)}")
 
 # ------------------------------------------------------------------
-# TAB 4: DHAN API CREDENTIALS
+# TAB 3: DHAN API CREDENTIALS
 # ------------------------------------------------------------------
 with tab_dhan:
     st.subheader("🔑 Dhan API Credential Management")
@@ -652,10 +668,12 @@ with tab_dhan:
                         st.error(msg)
 
 # ------------------------------------------------------------------
-# TAB 5: TELEGRAM ALERTS
+# TAB 4: TELEGRAM ALERTS
 # ------------------------------------------------------------------
 with tab_tg:
     st.subheader("📱 Telegram Notification Engine")
+    st.caption("Broadcasts alerts exclusively for BUY CE and BUY PE signals.")
+
     col_tg_cfg, col_tg_test = st.columns([2, 1])
 
     with col_tg_cfg:
@@ -672,7 +690,7 @@ with tab_tg:
                 st.rerun()
 
     with col_tg_test:
-        st.markdown("##### 🧪 Connection Test")
+        st.markdown("##### sbConnection Test")
         if st.button("Send Test Alert", use_container_width=True):
             if not st.session_state["tg_connected"]:
                 st.error("Configure Bot Token & Chat ID first.")
@@ -683,13 +701,13 @@ with tab_tg:
 
     st.divider()
     st.markdown("##### 🛡️ Alert Memory & Anti-Spam Cache")
-    st.write(f"Unique Alerts Memory Cache Count Today: **{len(st.session_state['sent_alerts'])}**")
+    st.write(f"Unique BUY CE / BUY PE Alerts Sent Today: **{len(st.session_state['sent_alerts'])}**")
     if st.button("Reset Alert Memory Cache"):
         st.session_state["sent_alerts"].clear()
         st.success("Alert Memory Reset.")
 
 # ------------------------------------------------------------------
-# TAB 6: RISK MANAGEMENT ENGINE
+# TAB 5: RISK MANAGEMENT ENGINE
 # ------------------------------------------------------------------
 with tab_risk:
     st.subheader("🛡️ Enterprise Risk & Capital Controls")
@@ -702,7 +720,7 @@ with tab_risk:
         st.session_state["rr_ratio"] = st.slider("Risk-to-Reward Target Multiple (1:X)", 1.5, 4.0, st.session_state["rr_ratio"], 0.1)
 
 # ------------------------------------------------------------------
-# TAB 7: AUTO SCAN CONTROLLER
+# TAB 6: AUTO SCAN CONTROLLER
 # ------------------------------------------------------------------
 with tab_autoscan:
     st.subheader("⏰ Automated Background Screener Daemon")
@@ -710,7 +728,7 @@ with tab_autoscan:
     st.session_state["auto_scan_interval"] = st.selectbox("Scan Frequency (Minutes)", [1, 3, 5, 15], index=2)
 
 # ------------------------------------------------------------------
-# TAB 8: ORDER LOGS
+# TAB 7: ORDER LOGS
 # ------------------------------------------------------------------
 with tab_orders:
     st.subheader("📜 Order Execution History")
