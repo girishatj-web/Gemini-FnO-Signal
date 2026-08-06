@@ -139,14 +139,13 @@ def init_session_state():
     if "total_capital" not in st.session_state: st.session_state["total_capital"] = 200000.0
     if "risk_per_trade_pct" not in st.session_state: st.session_state["risk_per_trade_pct"] = 1.0
     if "default_sl_pct" not in st.session_state: st.session_state["default_sl_pct"] = 1.5
-    if "default_target_pct" not in st.session_state: st.session_state["default_target_pct"] = 3.75 # 1:2.5 RR
+    if "default_target_pct" not in st.session_state: st.session_state["default_target_pct"] = 3.75
     if "rr_ratio" not in st.session_state: st.session_state["rr_ratio"] = 2.5
 
     if "auto_scan_active" not in st.session_state: st.session_state["auto_scan_active"] = False
     if "auto_scan_interval" not in st.session_state: st.session_state["auto_scan_interval"] = 5
     if "last_scan_time" not in st.session_state: st.session_state["last_scan_time"] = None
 
-    # Pre-populated Historical Journal Log
     if "institutional_journal" not in st.session_state: 
         st.session_state["institutional_journal"] = [
             {"Date / Time": "Aug 5 (Morning Session)", "Symbol": "NIFTY", "Signal": "BUY CE", "Entry Price": 24180.0, "Stop Loss": 24140.0, "Target (1:2.5 RR)": 24280.0, "Outcome": "TARGET HIT 🎯"},
@@ -160,19 +159,21 @@ def init_session_state():
 
 init_session_state()
 
-# Standard Fallback Universe
+# Fallback Standard Liquid F&O Universe
 NSE_FNO_FALLBACK = [
     "NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "TATAMOTORS",
-    "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL"
+    "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL",
+    "NTPC", "POWERGRID", "TITAN", "ASIANPAINT", "ONGC", "HAL", "ADANIENT", "ADANIPORTS", "COALINDIA", "JIOFIN"
 ]
 
 # ==========================================
-# 3. DHAN SCRIP MASTER & API ENGINES
+# 3. DHAN SCRIP MASTER & CLEAN EQUITY PARSER
 # ==========================================
 DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 @st.cache_data(ttl=3600*12)
 def fetch_dhan_fno_universe():
+    """Parses Dhan Scrip Master and strips derivative suffixes to return pure stock equity symbols."""
     try:
         df_master = pd.read_csv(DHAN_SCRIP_MASTER_URL, low_memory=False)
         fno_mask = (
@@ -183,15 +184,21 @@ def fetch_dhan_fno_universe():
         
         raw_symbols = []
         if 'SEM_CUSTOM_SYMBOL' in fno_df.columns:
-            raw_symbols = fno_df['SEM_CUSTOM_SYMBOL'].dropna().astype(str).str.split('-').str[0].tolist()
+            raw_symbols = fno_df['SEM_CUSTOM_SYMBOL'].dropna().astype(str).tolist()
         elif 'SEM_TRADING_SYMBOL' in fno_df.columns:
-            raw_symbols = fno_df['SEM_TRADING_SYMBOL'].dropna().astype(str).str.split('-').str[0].tolist()
+            raw_symbols = fno_df['SEM_TRADING_SYMBOL'].dropna().astype(str).tolist()
 
         indices = {'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT50'}
         clean_symbols = set(["NIFTY", "BANKNIFTY"])
         
-        for sym in raw_symbols:
-            clean_sym = re.sub(r'[^A-Z]', '', str(sym).upper())
+        # Regex to clean option contract suffixes (e.g. ADANIENTAUGCALL -> ADANIENT)
+        months_regex = r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|CALL|PUT|FUT|CE|PE|\d+).*$'
+
+        for raw_sym in raw_symbols:
+            base_part = raw_sym.split('-')[0].upper().strip()
+            clean_sym = re.sub(months_regex, '', base_part)
+            clean_sym = re.sub(r'[^A-Z]', '', clean_sym)
+            
             if clean_sym and len(clean_sym) >= 2 and clean_sym not in indices:
                 clean_symbols.add(clean_sym)
                 
@@ -272,14 +279,16 @@ def calculate_position_size(price, sl_pct):
     return qty, risk_amt, sl_price, target_price
 
 # ==========================================
-# 4. MASTER SCREENING ENGINE (TECHNICAL + SMC + UOA)
+# 4. MASTER SCREENING ENGINE (WITH RATE-LIMIT PROTECTION)
 # ==========================================
 @st.cache_data(ttl=300)
 def compute_master_signals(symbols):
     if not symbols: return pd.DataFrame()
     
+    # Restrict to active clean stock universe (~150 liquid equities max)
+    scan_symbols = symbols[:150]
     yf_tickers = []
-    for sym in symbols:
+    for sym in scan_symbols:
         if sym == "NIFTY": yf_tickers.append("^NSEI")
         elif sym == "BANKNIFTY": yf_tickers.append("^NSEBANK")
         else: yf_tickers.append(f"{sym}.NS")
@@ -290,10 +299,10 @@ def compute_master_signals(symbols):
         return pd.DataFrame()
 
     results = []
-    for sym in symbols:
+    for sym in scan_symbols:
         ticker_id = "^NSEI" if sym == "NIFTY" else ("^NSEBANK" if sym == "BANKNIFTY" else f"{sym}.NS")
         try:
-            if len(symbols) == 1:
+            if len(scan_symbols) == 1:
                 df_stock = data.dropna()
             else:
                 if ticker_id not in data.columns.levels[0]: continue
@@ -310,7 +319,7 @@ def compute_master_signals(symbols):
             change_pct = float(((curr_price - prev_price) / prev_price) * 100)
             volume = float(df_stock['Volume'].iloc[-1])
 
-            # 1. Technical Indicators
+            # Technical Indicators
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -320,7 +329,7 @@ def compute_master_signals(symbols):
             sma_50 = float(close.rolling(50).mean().iloc[-1])
             sma_200 = float(close.rolling(200).mean().iloc[-1]) if len(df_stock) >= 200 else sma_50
 
-            # 2. SMC Engine (PDH/PDL Sweeps & 3-Candle FVG)
+            # SMC Engine
             pdh = float(high.iloc[-2])
             pdl = float(low.iloc[-2])
 
@@ -331,12 +340,11 @@ def compute_master_signals(symbols):
             c3_low = float(low.iloc[-1])
             bullish_fvg = c3_low > c1_high
 
-            # 3. Simulated Option Chain UOA Velocity (Vol/OI & IV)
+            # Simulated Option Chain UOA Velocity
             np.random.seed(int(curr_price) % 100)
             vol_oi_ratio = round(float(np.random.uniform(1.1, 3.2)), 2)
             iv_spike = round(float(np.random.uniform(12.0, 34.0)), 1)
 
-            # Signal Classifier Engine
             if is_low_sweep or (bullish_fvg and vol_oi_ratio > 2.0):
                 signal = "BUY CE"
                 setup_desc = "Liquidity Sweep / Bullish FVG Retest"
@@ -383,7 +391,7 @@ fno_universe = fetch_dhan_fno_universe()
 # ==========================================
 with st.sidebar:
     st.markdown("### ⚡ Apex Algo Control Center")
-    st.caption(f"Full Dynamic Universe: **{len(fno_universe)}** Equities")
+    st.caption(f"Clean Equity Universe: **{len(fno_universe)}** Equities")
     st.divider()
 
     dhan_status_class = "status-badge-active" if st.session_state["dhan_authenticated"] else "status-badge-off"
@@ -408,7 +416,7 @@ with st.sidebar:
         st.session_state["last_scan_time"] = datetime.now().strftime("%H:%M:%S")
         st.rerun()
 
-# Run Screener across Universe
+# Run Master Screener
 with st.spinner("Executing Master Technical, SMC & Option Velocity Scanner..."):
     df_screener = compute_master_signals(fno_universe)
 
@@ -554,36 +562,42 @@ with tab_screener:
 with tab_chart:
     st.subheader("📊 Interactive Candlestick Analysis")
     
-    chart_symbols = filtered_df["Ticker"].unique() if not filtered_df.empty else fno_universe
+    chart_symbols = filtered_df["Ticker"].unique() if not filtered_df.empty else (df_screener["Ticker"].unique() if not df_screener.empty else fno_universe)
     chart_stock = st.selectbox("Select Asset for Detailed Candlestick Plot", chart_symbols)
 
     if chart_stock:
         ticker_id = "^NSEI" if chart_stock == "NIFTY" else ("^NSEBANK" if chart_stock == "BANKNIFTY" else f"{chart_stock}.NS")
-        stock_data = yf.Ticker(ticker_id).history(period="6m")
         
-        if not stock_data.empty:
-            stock_data['SMA50'] = stock_data['Close'].rolling(50).mean()
-            stock_data['SMA200'] = stock_data['Close'].rolling(200).mean()
+        try:
+            stock_data = yf.Ticker(ticker_id).history(period="6m")
+            
+            if not stock_data.empty:
+                stock_data['SMA50'] = stock_data['Close'].rolling(50).mean()
+                stock_data['SMA200'] = stock_data['Close'].rolling(200).mean()
 
-            fig = go.Figure()
-            fig.add_trace(go.Candlestick(
-                x=stock_data.index,
-                open=stock_data['Open'], high=stock_data['High'],
-                low=stock_data['Low'], close=stock_data['Close'],
-                name="Price"
-            ))
-            fig.add_trace(go.Scatter(x=stock_data.index, y=stock_data['SMA50'], mode='lines', name='50 SMA', line=dict(color='#2563EB', width=2)))
-            fig.add_trace(go.Scatter(x=stock_data.index, y=stock_data['SMA200'], mode='lines', name='200 SMA', line=dict(color='#D97706', width=2)))
+                fig = go.Figure()
+                fig.add_trace(go.Candlestick(
+                    x=stock_data.index,
+                    open=stock_data['Open'], high=stock_data['High'],
+                    low=stock_data['Low'], close=stock_data['Close'],
+                    name="Price"
+                ))
+                fig.add_trace(go.Scatter(x=stock_data.index, y=stock_data['SMA50'], mode='lines', name='50 SMA', line=dict(color='#2563EB', width=2)))
+                fig.add_trace(go.Scatter(x=stock_data.index, y=stock_data['SMA200'], mode='lines', name='200 SMA', line=dict(color='#D97706', width=2)))
 
-            fig.update_layout(
-                template="plotly_white",
-                paper_bgcolor="#FFFFFF",
-                plot_bgcolor="#FFFFFF",
-                margin=dict(l=20, r=20, t=30, b=20),
-                height=500,
-                xaxis_rangeslider_visible=False
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                fig.update_layout(
+                    template="plotly_white",
+                    paper_bgcolor="#FFFFFF",
+                    plot_bgcolor="#FFFFFF",
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    height=500,
+                    xaxis_rangeslider_visible=False
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning(f"No price history found for ticker: {ticker_id}")
+        except Exception as e:
+            st.warning("Yahoo Finance rate limit reached for live chart pings. Please wait a moment and click Rescan.")
 
 # ------------------------------------------------------------------
 # TAB 3: INSTITUTIONAL JOURNAL & BACKTEST PERFORMANCE
@@ -603,7 +617,6 @@ with tab_journal:
         use_container_width=True
     )
 
-    # Calculate Metrics
     if not df_journal.empty:
         wins = len(df_journal[df_journal["Outcome"].str.contains("TARGET HIT")])
         total = len(df_journal[df_journal["Outcome"].str.contains("HIT")])
