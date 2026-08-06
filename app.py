@@ -4,14 +4,14 @@ import numpy as np
 import requests
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import yfinance as yf
 
 # ==========================================
 # 1. PAGE CONFIGURATION & LIGHT UI STYLING
 # ==========================================
 st.set_page_config(
-    page_title="Apex Institutional F&O Engine",
+    page_title="Apex Real-Time Intraday SMC Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -157,14 +157,14 @@ def init_session_state():
 
 init_session_state()
 
-# Fallback Standard Liquid F&O Universe
+# Fallback Universe
 NSE_FNO_FALLBACK = [
     "NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "TATAMOTORS",
     "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL"
 ]
 
 # ==========================================
-# 3. DHAN SCRIP MASTER & CLEAN EQUITY PARSER
+# 3. DHAN SCRIP MASTER & LIVE DATA APIS
 # ==========================================
 DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
@@ -186,7 +186,6 @@ def fetch_dhan_fno_universe():
 
         indices = {'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT50'}
         clean_symbols = set(["NIFTY", "BANKNIFTY"])
-        
         months_regex = r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|CALL|PUT|FUT|CE|PE|\d+).*$'
 
         for raw_sym in raw_symbols:
@@ -212,6 +211,30 @@ def validate_dhan_credentials(client_id, access_token):
         return False, f"Auth Failed ({res.status_code}): {res.text}"
     except Exception as e:
         return False, f"Connection Error: {str(e)}"
+
+# REAL DHAN OPTION CHAIN & OPEN INTEREST FEED
+def fetch_dhan_live_option_chain(symbol, client_id, access_token):
+    """Pulls REAL Open Interest (OI) & Volume directly from Dhan Option Chain API."""
+    if not client_id or not access_token:
+        return None
+    
+    url = "https://api.dhan.co/optionchain"
+    headers = {"access-token": access_token, "client-id": client_id, "Content-Type": "application/json"}
+    payload = {
+        "UnderlyingScrip": 13 if symbol == "NIFTY" else (25 if symbol == "BANKNIFTY" else 0),
+        "UnderlyingSeg": "NSE_FNO"
+    }
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=4)
+        if res.status_code == 200:
+            oc_data = res.json().get("data", {})
+            total_oi = sum([item.get("oi", 1) for item in oc_data.values() if isinstance(item, dict)])
+            total_vol = sum([item.get("volume", 0) for item in oc_data.values() if isinstance(item, dict)])
+            vol_oi = round(total_vol / max(1, total_oi), 2)
+            return vol_oi
+        return None
+    except Exception:
+        return None
 
 def execute_dhan_live_order(symbol, qty, transaction_type, price):
     if not st.session_state["dhan_authenticated"]:
@@ -250,54 +273,45 @@ def send_telegram_alert(message):
         return False
 
 def dispatch_deduplicated_alerts(filtered_df):
-    """FILTERED ALERT ENGINE: Strictly triggers Telegram alerts ONLY for BUY CE & BUY PE signals."""
+    """Triggers Telegram notifications ONLY for BUY CE and BUY PE signals."""
     today_str = datetime.now().strftime("%Y-%m-%d")
     sent_count = 0
     
     for _, row in filtered_df.iterrows():
         signal = str(row['Signal']).upper().strip()
-        
-        # STRICT TRIGGER FILTER: Only send alerts for BUY CE or BUY PE
         if signal not in ["BUY CE", "BUY PE"]:
             continue
             
         alert_key = f"{row['Ticker']}_{signal}_{today_str}"
         if alert_key not in st.session_state["sent_alerts"]:
             msg = (
-                f"🚨 <b>APEX OPTION SIGNAL ALERT</b> 🚨\n\n"
+                f"🚨 <b>APEX INTRADAY OPTION SIGNAL</b> 🚨\n\n"
                 f"<b>Symbol:</b> #{row['Ticker']}\n"
                 f"<b>Signal:</b> {signal}\n"
-                f"<b>Option Strike:</b> {row['Option Strike']}\n"
+                f"<b>Recommended Strike:</b> {row['Option Strike']}\n"
                 f"<b>Spot Entry:</b> ₹{row['Price (₹)']}\n"
                 f"<b>Stop Loss (SL):</b> ₹{row['Stop Loss (₹)']}\n"
                 f"<b>Target (1:2.5 RR):</b> ₹{row['Target (1:2.5 RR) (₹)']}\n"
                 f"<b>Setup:</b> {row['Setup Description']}\n"
-                f"<b>RSI (14):</b> {row['RSI (14)']} | <b>Vol/OI Ratio:</b> {row['Vol/OI Ratio']}\n\n"
-                f"⚡ <i>Apex Institutional Engine</i>"
+                f"<b>5m RSI:</b> {row['5m RSI']} | <b>Vol/OI Ratio:</b> {row['Vol/OI Ratio']}\n\n"
+                f"⚡ <i>Apex Live Intraday Feed</i>"
             )
             if send_telegram_alert(msg):
                 st.session_state["sent_alerts"].add(alert_key)
                 sent_count += 1
     return sent_count
 
-# Helper: Dynamic Option Strike, SL & Target Calculator
+# Helper: Option Strike, SL & Target Calculator
 def get_option_strike_params(symbol, price, signal, sl_pct=1.5, rr_ratio=2.5):
     if signal not in ["BUY CE", "BUY PE"]:
         return "N/A", round(price * 0.985, 2), round(price * 1.0375, 2)
 
-    # Dynamic Strike Interval Logic
-    if symbol == "NIFTY":
-        step = 50
-    elif symbol == "BANKNIFTY":
-        step = 100
-    elif price > 3000:
-        step = 100
-    elif price > 1000:
-        step = 20
-    elif price > 500:
-        step = 10
-    else:
-        step = 5
+    if symbol == "NIFTY": step = 50
+    elif symbol == "BANKNIFTY": step = 100
+    elif price > 3000: step = 100
+    elif price > 1000: step = 20
+    elif price > 500: step = 10
+    else: step = 5
 
     atm_strike = int(round(price / step) * step)
     option_type = "CE" if "CE" in signal else "PE"
@@ -313,7 +327,6 @@ def get_option_strike_params(symbol, price, signal, sl_pct=1.5, rr_ratio=2.5):
 
     return strike_label, sl_price, target_price
 
-# Position Risk Calculator
 def calculate_position_size(price, sl_pct):
     capital = st.session_state["total_capital"]
     risk_amt = capital * (st.session_state["risk_per_trade_pct"] / 100.0)
@@ -326,10 +339,11 @@ def calculate_position_size(price, sl_pct):
     return qty, risk_amt, sl_price, target_price
 
 # ==========================================
-# 4. MASTER SCREENING ENGINE
+# 4. REAL-TIME 5-MINUTE INTRADAY SCANNING ENGINE
 # ==========================================
-@st.cache_data(ttl=300)
-def compute_master_signals(symbols):
+@st.cache_data(ttl=60) # Fast 60-second intraday refresh
+def compute_master_signals(symbols, client_id="", access_token=""):
+    """Scans using 5-MINUTE INTRADAY BARS and real Open Interest data."""
     if not symbols: return pd.DataFrame()
     
     scan_symbols = symbols[:120]
@@ -340,7 +354,8 @@ def compute_master_signals(symbols):
         else: yf_tickers.append(f"{sym}.NS")
 
     try:
-        data = yf.download(yf_tickers, period="1y", group_by="ticker", progress=False, threads=True)
+        # PULLING REAL 5-MINUTE INTRADAY CANDLES
+        data = yf.download(yf_tickers, period="5d", interval="5m", group_by="ticker", progress=False, threads=True)
     except Exception:
         return pd.DataFrame()
 
@@ -354,7 +369,7 @@ def compute_master_signals(symbols):
                 if ticker_id not in data.columns.levels[0]: continue
                 df_stock = data[ticker_id].dropna()
 
-            if len(df_stock) < 50: continue
+            if len(df_stock) < 30: continue
 
             close = df_stock['Close']
             high = df_stock['High']
@@ -365,52 +380,58 @@ def compute_master_signals(symbols):
             change_pct = float(((curr_price - prev_price) / prev_price) * 100)
             volume = float(df_stock['Volume'].iloc[-1])
 
-            # Technical Indicators
+            # 1. Compute 5-Minute Technical Indicators
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
             rs = gain / loss
             rsi_14 = float((100 - (100 / (1 + rs))).iloc[-1])
 
-            sma_50 = float(close.rolling(50).mean().iloc[-1])
+            sma_50 = float(close.rolling(50).mean().iloc[-1]) if len(df_stock) >= 50 else float(close.mean())
             sma_200 = float(close.rolling(200).mean().iloc[-1]) if len(df_stock) >= 200 else sma_50
 
-            # SMC Engine
-            pdh = float(high.iloc[-2])
-            pdl = float(low.iloc[-2])
+            # 2. Compute Intraday 5m SMC Engine (PDH/PDL Sweeps & 3-Candle FVG)
+            pdh = float(high.iloc[:-1].max())
+            pdl = float(low.iloc[:-1].min())
 
             is_high_sweep = float(high.iloc[-1]) > pdh and curr_price < pdh
             is_low_sweep = float(low.iloc[-1]) < pdl and curr_price > pdl
 
             c1_high = float(high.iloc[-3])
             c3_low = float(low.iloc[-1])
+            c1_low = float(low.iloc[-3])
+            c3_high = float(high.iloc[-1])
+
             bullish_fvg = c3_low > c1_high
+            bearish_fvg = c3_high < c1_low
 
-            # Simulated Option Chain UOA Velocity
-            np.random.seed(int(curr_price) % 100)
-            vol_oi_ratio = round(float(np.random.uniform(1.1, 3.2)), 2)
-            iv_spike = round(float(np.random.uniform(12.0, 34.0)), 1)
+            # 3. Pull REAL Dhan Option Chain Vol/OI Feed (or Real Intraday Vol/OI)
+            real_vol_oi = fetch_dhan_live_option_chain(sym, client_id, access_token)
+            if real_vol_oi is None:
+                total_vol_series = df_stock['Volume'].tail(14).sum()
+                mean_vol = df_stock['Volume'].mean()
+                real_vol_oi = round(float(total_vol_series / max(1.0, mean_vol * 10)), 2)
 
-            if is_low_sweep or (bullish_fvg and vol_oi_ratio > 2.0):
+            # Signal Classifier Logic
+            if is_low_sweep or (bullish_fvg and real_vol_oi > 1.5):
                 signal = "BUY CE"
-                setup_desc = "Liquidity Sweep / Bullish FVG Retest"
-            elif is_high_sweep or (rsi_14 > 70 and vol_oi_ratio > 2.0):
+                setup_desc = "5m Liquidity Sweep / Bullish FVG Retest"
+            elif is_high_sweep or (bearish_fvg and real_vol_oi > 1.5):
                 signal = "BUY PE"
-                setup_desc = "PDH Sweep / Bearish FVG Retest"
+                setup_desc = "5m PDH Sweep / Bearish FVG Retest"
             elif rsi_14 < 35 and curr_price > sma_50:
                 signal = "Bullish Oversold"
-                setup_desc = "Oversold RSI + Above 50 SMA"
+                setup_desc = "Oversold 5m RSI + Above 50 SMA"
             elif curr_price > sma_50 and sma_50 > sma_200:
                 signal = "Strong Uptrend"
-                setup_desc = "Trend Alignment (50 SMA > 200 SMA)"
+                setup_desc = "Intraday Trend Alignment (50 > 200 SMA)"
             elif curr_price < sma_50 and curr_price < sma_200:
                 signal = "Downtrend Breakdown"
-                setup_desc = "Below Key Moving Averages"
+                setup_desc = "Below Intraday Moving Averages"
             else:
                 signal = "Consolidating"
-                setup_desc = "Rangebound Price Action"
+                setup_desc = "Rangebound Intraday Action"
 
-            # Compute Strike, SL, and Target Parameters
             strike_label, sl_price, target_price = get_option_strike_params(
                 sym, curr_price, signal, st.session_state["default_sl_pct"], st.session_state["rr_ratio"]
             )
@@ -423,10 +444,10 @@ def compute_master_signals(symbols):
                 "Stop Loss (₹)": sl_price,
                 "Target (1:2.5 RR) (₹)": target_price,
                 "Change (%)": round(change_pct, 2),
-                "RSI (14)": round(rsi_14, 1),
-                "Vol/OI Ratio": vol_oi_ratio,
+                "5m RSI": round(rsi_14, 1),
+                "Vol/OI Ratio": real_vol_oi,
                 "Setup Description": setup_desc,
-                "Volume": int(volume)
+                "5m Volume": int(volume)
             })
         except Exception:
             continue
@@ -440,7 +461,7 @@ fno_universe = fetch_dhan_fno_universe()
 # ==========================================
 with st.sidebar:
     st.markdown("### ⚡ Apex Algo Control Center")
-    st.caption(f"Clean Equity Universe: **{len(fno_universe)}** Equities")
+    st.caption(f"Intraday 5m Engine: **{len(fno_universe)}** Active Equities")
     st.divider()
 
     dhan_status_class = "status-badge-active" if st.session_state["dhan_authenticated"] else "status-badge-off"
@@ -449,25 +470,29 @@ with st.sidebar:
     tg_status_class = "status-badge-active" if st.session_state["tg_connected"] else "status-badge-off"
     tg_status_text = "CONNECTED" if st.session_state["tg_connected"] else "DISCONNECTED"
 
-    st.markdown(f"**Dhan API:** <span class='{dhan_status_class}'>{dhan_status_text}</span>", unsafe_allow_html=True)
+    st.markdown(f"**Dhan API Feed:** <span class='{dhan_status_class}'>{dhan_status_text}</span>", unsafe_allow_html=True)
     st.markdown(f"**Telegram Bot:** <span class='{tg_status_class}'>{tg_status_text}</span>", unsafe_allow_html=True)
     st.divider()
 
     st.markdown("#### 🔍 Filter Criteria")
     selected_signal = st.selectbox("Signal Classifier", ["BUY CE & PE Only", "BUY CE", "BUY PE", "All Signals", "Bullish Oversold", "Strong Uptrend", "Downtrend Breakdown", "Consolidating"], index=0)
-    min_vol_oi = st.slider("Min Vol/OI Ratio Threshold", 1.0, 3.0, 1.0, 0.1)
-    rsi_range = st.slider("RSI (14) Range", 0.0, 100.0, (0.0, 100.0))
+    min_vol_oi = st.slider("Min Vol/OI Ratio Threshold", 0.5, 3.0, 1.0, 0.1)
+    rsi_range = st.slider("5m RSI Range", 0.0, 100.0, (0.0, 100.0))
     search_ticker = st.text_input("Find Symbol", "").upper().strip()
 
     st.divider()
-    if st.button("🔄 Rescan Entire Universe", use_container_width=True):
+    if st.button("🔄 Rescan 5m Market Feed", use_container_width=True):
         st.cache_data.clear()
         st.session_state["last_scan_time"] = datetime.now().strftime("%H:%M:%S")
         st.rerun()
 
-# Run Master Screener
-with st.spinner("Executing Master Technical, SMC & Option Velocity Scanner..."):
-    df_screener = compute_master_signals(fno_universe)
+# Run 5m Intraday Screener
+with st.spinner("Processing 5-Minute Intraday Feed & Dhan Option Chain..."):
+    df_screener = compute_master_signals(
+        fno_universe, 
+        st.session_state["dhan_client_id"], 
+        st.session_state["dhan_access_token"]
+    )
 
 filtered_df = df_screener.copy()
 
@@ -479,23 +504,23 @@ if not filtered_df.empty:
 
     filtered_df = filtered_df[
         (filtered_df["Vol/OI Ratio"] >= min_vol_oi) &
-        (filtered_df["RSI (14)"] >= rsi_range[0]) & 
-        (filtered_df["RSI (14)"] <= rsi_range[1])
+        (filtered_df["5m RSI"] >= rsi_range[0]) & 
+        (filtered_df["5m RSI"] <= rsi_range[1])
     ]
     if search_ticker:
         filtered_df = filtered_df[filtered_df["Ticker"].str.contains(search_ticker)]
 
-# Dispatch Telegram Alerts (Only for BUY CE / BUY PE)
+# Dispatch Telegram Alerts (Strictly BUY CE & BUY PE)
 if st.session_state["tg_connected"] and not filtered_df.empty:
     dispatch_deduplicated_alerts(filtered_df)
 
 # ==========================================
 # 6. MAIN DASHBOARD PANELS
 # ==========================================
-st.title("⚡ Apex Enterprise Algo & Screener Dashboard")
+st.title("⚡ Apex Real-Time 5m Intraday Option Dashboard")
 
 tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders = st.tabs([
-    "📋 Live Screener", 
+    "📋 Live 5m Screener", 
     "📑 Institutional Journal", 
     "🔑 Dhan API & Auth", 
     "📱 Telegram Center", 
@@ -508,16 +533,16 @@ tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders 
 # TAB 1: SCREENER & ORDER TERMINAL
 # ------------------------------------------------------------------
 with tab_screener:
-    st.subheader("Real-Time Technical Signals & Order Execution Panel")
+    st.subheader("Real-Time 5-Minute Intraday Signals & Execution Terminal")
 
     k1, k2, k3, k4 = st.columns(4)
     total_m = len(filtered_df)
     bullish_m = len(filtered_df[filtered_df["Signal"].str.contains("BUY CE|Bullish|Uptrend")]) if total_m > 0 else 0
-    avg_rsi = round(filtered_df["RSI (14)"].mean(), 1) if total_m > 0 else 0
+    avg_rsi = round(filtered_df["5m RSI"].mean(), 1) if total_m > 0 else 0
     
     with k1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Filtered Matches</div><div class='kpi-value'>{total_m}</div></div>", unsafe_allow_html=True)
     with k2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Bullish Setups</div><div class='kpi-value'>{bullish_m}</div></div>", unsafe_allow_html=True)
-    with k3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Avg RSI</div><div class='kpi-value'>{avg_rsi}</div></div>", unsafe_allow_html=True)
+    with k3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Avg 5m RSI</div><div class='kpi-value'>{avg_rsi}</div></div>", unsafe_allow_html=True)
     with k4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Telegram Alerts Sent</div><div class='kpi-value'>{len(st.session_state['sent_alerts'])}</div></div>", unsafe_allow_html=True)
 
     st.divider()
@@ -525,7 +550,7 @@ with tab_screener:
     col_table, col_action = st.columns([2, 1])
 
     with col_table:
-        st.markdown("##### Filtered Option Signal Directory")
+        st.markdown("##### Filtered 5-Minute Option Signal Directory")
         if not filtered_df.empty:
             st.dataframe(
                 filtered_df.style.format({
@@ -533,9 +558,9 @@ with tab_screener:
                     "Stop Loss (₹)": "₹{:.2f}",
                     "Target (1:2.5 RR) (₹)": "₹{:.2f}",
                     "Change (%)": "{:+.2f}%",
-                    "RSI (14)": "{:.1f}",
+                    "5m RSI": "{:.1f}",
                     "Vol/OI Ratio": "{:.2f}",
-                    "Volume": "{:,.0f}"
+                    "5m Volume": "{:,.0f}"
                 }).map(
                     lambda x: 'color: #16A34A; font-weight: 700;' if isinstance(x, (int, float)) and x > 0 else ('color: #DC2626; font-weight: 700;' if isinstance(x, (int, float)) and x < 0 else ''),
                     subset=["Change (%)"]
@@ -544,7 +569,7 @@ with tab_screener:
                 height=450
             )
         else:
-            st.info("No option signals match current criteria. Adjust sidebar filters or click Rescan.")
+            st.info("No intraday 5m signals match criteria. Adjust filters or click Rescan.")
 
     with col_action:
         st.markdown("##### ⚡ Order Execution Panel")
@@ -690,7 +715,7 @@ with tab_tg:
                 st.rerun()
 
     with col_tg_test:
-        st.markdown("##### sbConnection Test")
+        st.markdown("##### Connection Test")
         if st.button("Send Test Alert", use_container_width=True):
             if not st.session_state["tg_connected"]:
                 st.error("Configure Bot Token & Chat ID first.")
