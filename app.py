@@ -11,7 +11,7 @@ import yfinance as yf
 # 1. PAGE CONFIGURATION & LIGHT UI STYLING
 # ==========================================
 st.set_page_config(
-    page_title="Apex Multi-Timeframe F&O Engine",
+    page_title="F&O Signal Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -149,10 +149,8 @@ def init_session_state():
 
     if "institutional_journal" not in st.session_state: 
         st.session_state["institutional_journal"] = [
-            {"Date / Time": "05-Aug-2026 09:30:00", "Symbol": "NIFTY", "Signal": "BUY CE", "Option Strike": "NIFTY 24200 CE", "Entry Price": 24180.0, "Stop Loss": 24140.0, "Target (1:2.5 RR)": 24280.0, "Outcome": "TARGET HIT 🎯"},
-            {"Date / Time": "05-Aug-2026 13:45:00", "Symbol": "BANKNIFTY", "Signal": "BUY PE", "Option Strike": "BANKNIFTY 51500 PE", "Entry Price": 51450.0, "Stop Loss": 51600.0, "Target (1:2.5 RR)": 51075.0, "Outcome": "STOP LOSS HIT ❌"},
-            {"Date / Time": "06-Aug-2026 09:20:00", "Symbol": "NIFTY", "Signal": "BUY CE", "Option Strike": "NIFTY 24200 CE", "Entry Price": 24220.0, "Stop Loss": 24180.0, "Target (1:2.5 RR)": 24320.0, "Outcome": "TARGET HIT 🎯"},
-            {"Date / Time": "06-Aug-2026 11:15:00", "Symbol": "RELIANCE", "Signal": "BUY PE", "Option Strike": "RELIANCE 2980 PE", "Entry Price": 2980.0, "Stop Loss": 2995.0, "Target (1:2.5 RR)": 2942.0, "Outcome": "TARGET HIT 🎯"},
+            {"Date / Time": "05-Aug-2026 09:30:00", "Symbol": "NIFTY", "Signal": "BUY CE", "Option Contract": "NIFTY 24200 CE", "Contract Entry (₹)": 145.00, "Stop Loss (₹)": 101.50, "Target (₹)": 253.75, "Outcome": "TARGET HIT 🎯"},
+            {"Date / Time": "05-Aug-2026 13:45:00", "Symbol": "BANKNIFTY", "Signal": "BUY PE", "Option Contract": "BANKNIFTY 51500 PE", "Contract Entry (₹)": 280.00, "Stop Loss (₹)": 196.00, "Target (₹)": 490.00, "Outcome": "STOP LOSS HIT ❌"},
         ]
 
     if "paper_trade_log" not in st.session_state: st.session_state["paper_trade_log"] = []
@@ -246,7 +244,7 @@ def execute_dhan_live_order(symbol, qty, transaction_type, price):
     payload = {
         "dhanClientId": st.session_state["dhan_client_id"],
         "transactionType": transaction_type.upper(),
-        "exchangeSegment": "NSE_EQ",
+        "exchangeSegment": "NSE_FNO",
         "productType": "INTRADAY",
         "orderType": "MARKET",
         "validity": "DAY",
@@ -285,60 +283,60 @@ def dispatch_deduplicated_alerts(filtered_df, tf_label):
         alert_key = f"{row['Ticker']}_{signal}_{tf_label}_{today_str}"
         if alert_key not in st.session_state["sent_alerts"]:
             msg = (
-                f"🚨 <b>APEX PDH/PDL & ORB ALERT ({tf_label})</b> 🚨\n\n"
+                f"🚨 <b>APEX CONTRACT OPTION ALERT ({tf_label})</b> 🚨\n\n"
                 f"<b>Signal Timestamp:</b> {row['Signal Timestamp']}\n"
                 f"<b>Symbol:</b> #{row['Ticker']}\n"
                 f"<b>Timeframe:</b> {tf_label}\n"
                 f"<b>Signal:</b> {signal}\n"
-                f"<b>Recommended Strike:</b> {row['Option Strike']}\n"
-                f"<b>Spot Entry:</b> ₹{row['Price (₹)']}\n"
+                f"<b>Option Contract:</b> {row['Option Contract']}\n"
+                f"<b>Contract Entry Premium:</b> ₹{row['Option Price (₹)']}\n"
                 f"<b>Stop Loss (SL):</b> ₹{row['Stop Loss (₹)']}\n"
+                f"<b>Trailing SL (TSL):</b> ₹{row['Trailing SL (₹)']}\n"
                 f"<b>Target (1:2.5 RR):</b> ₹{row['Target (1:2.5 RR) (₹)']}\n"
                 f"<b>Setup:</b> {row['Setup Description']}\n"
                 f"<b>RSI (14):</b> {row['RSI (14)']} | <b>Vol/OI Ratio:</b> {row['Vol/OI Ratio']}\n\n"
-                f"⚡ <i>Apex Multi-Structure Feed</i>"
+                f"⚡ <i>Apex Contract Pricing Feed</i>"
             )
             if send_telegram_alert(msg):
                 st.session_state["sent_alerts"].add(alert_key)
                 sent_count += 1
     return sent_count
 
-# Helper: Option Strike, SL & Target Calculator
-def get_option_strike_params(symbol, price, signal, sl_pct=1.5, rr_ratio=2.5):
+# Helper: Option Contract Pricing & Risk Calculator
+def get_option_contract_pricing(symbol, spot_price, signal, sl_pct=1.5, rr_ratio=2.5):
     if signal not in ["BUY CE", "BUY PE"]:
-        return "N/A", round(price * 0.985, 2), round(price * 1.0375, 2)
+        return "N/A", 0.0, 0.0, 0.0, 0.0
 
     if symbol == "NIFTY": step = 50
     elif symbol == "BANKNIFTY": step = 100
-    elif price > 3000: step = 100
-    elif price > 1000: step = 20
-    elif price > 500: step = 10
+    elif spot_price > 3000: step = 100
+    elif spot_price > 1000: step = 20
+    elif spot_price > 500: step = 10
     else: step = 5
 
-    atm_strike = int(round(price / step) * step)
+    atm_strike = int(round(spot_price / step) * step)
     option_type = "CE" if "CE" in signal else "PE"
     strike_label = f"{symbol} {atm_strike} {option_type}"
 
-    sl_dist = price * (sl_pct / 100.0)
-    if "CE" in signal:
-        sl_price = round(price - sl_dist, 2)
-        target_price = round(price + (sl_dist * rr_ratio), 2)
-    else:
-        sl_price = round(price + sl_dist, 2)
-        target_price = round(price - (sl_dist * rr_ratio), 2)
+    # Modeled Option Premium (~2.5% of spot price for near-ATM contract)
+    option_price = round(spot_price * 0.025, 2)
+    
+    # Option Risk calculation (Option Delta approx 0.5 modeling)
+    option_risk = option_price * (sl_pct / 2.0)
+    
+    option_sl = round(max(0.5, option_price - option_risk), 2)
+    option_target = round(option_price + (option_risk * rr_ratio), 2)
+    option_tsl = round(option_sl + (option_risk * 0.4), 2) # Trailing SL baseline
 
-    return strike_label, sl_price, target_price
+    return strike_label, option_price, option_sl, option_target, option_tsl
 
-def calculate_position_size(price, sl_pct):
+def calculate_position_size(option_price, sl_price):
     capital = st.session_state["total_capital"]
     risk_amt = capital * (st.session_state["risk_per_trade_pct"] / 100.0)
-    sl_per_share = price * (sl_pct / 100.0)
-    if sl_per_share <= 0: return 1, risk_amt, price * 0.98, price * 1.04
+    risk_per_unit = max(0.5, option_price - sl_price)
     
-    qty = max(1, int(risk_amt / sl_per_share))
-    sl_price = round(price - sl_per_share, 2)
-    target_price = round(price + (sl_per_share * st.session_state["rr_ratio"]), 2)
-    return qty, risk_amt, sl_price, target_price
+    qty = max(1, int(risk_amt / risk_per_unit))
+    return qty, risk_amt
 
 # Helper: Persistent Market-Hour Timestamp Attacher
 def attach_persistent_timestamps(df, tf_label):
@@ -376,7 +374,7 @@ TIMEFRAME_MAP = {
 
 @st.cache_data(ttl=90)
 def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access_token=""):
-    """Scans with PDH/PDL Prior Structure Support & ORB Gap Rules."""
+    """Scans with PDH/PDL Prior Structure & Option Contract Pricing Engine."""
     if not symbols: return pd.DataFrame()
     
     tf_info = TIMEFRAME_MAP.get(timeframe_key, TIMEFRAME_MAP["5 Mins"])
@@ -486,13 +484,11 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
                 orl = pdl
                 gap_pct = 0.0
 
-            # Structural Breakouts: Combining Intraday ORB and Previous Day High/Low (PDH/PDL)
             pdh_break = curr_price > pdh and float(close.iloc[-2]) <= pdh
             pdl_break = curr_price < pdl and float(close.iloc[-2]) >= pdl
             orb_bullish = curr_price > orh and float(close.iloc[-2]) <= orh
             orb_bearish = curr_price < orl and float(close.iloc[-2]) >= orl
 
-            # Vol / OI Feed
             real_vol_oi = fetch_dhan_live_option_chain(sym, client_id, access_token)
             if real_vol_oi is None:
                 total_vol_series = df_stock['Volume'].tail(14).sum()
@@ -503,16 +499,15 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
             is_downtrend = curr_price < sma_50
             strong_volume = real_vol_oi >= 1.5
 
-            # 2% Gap Rule Enforcement
             is_extreme_gap_up = gap_pct > 2.0
             allow_ce_signal = True
             if is_extreme_gap_up and not (orb_bullish or pdh_break) and len(today_df) <= 3:
                 allow_ce_signal = False
 
-            # Signal Classifier with PDH/PDL & ORB Integration
+            # Signal Classifier
             if (pdh_break or orb_bullish or (curr_price > pdh and is_uptrend)) and allow_ce_signal and strong_volume and (45 <= rsi_14 <= 75):
                 signal = "BUY CE"
-                setup_desc = f"{tf_label} PDH Break / ORB Impulse + Volume Confirmation"
+                setup_desc = f"{tf_label} PDH Break / ORB Impulse + Volume"
             elif (pdl_break or orb_bearish) and is_downtrend and strong_volume and (25 <= rsi_14 <= 55):
                 signal = "BUY PE"
                 setup_desc = f"{tf_label} PDL Breakdown / ORB Structure"
@@ -527,9 +522,10 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
                 setup_desc = f"Verified Bearish Breakdown"
             else:
                 signal = "Consolidating"
-                setup_desc = f"Rangebound / Waiting for PDH/PDL Structure"
+                setup_desc = f"Rangebound / Waiting for Structure"
 
-            strike_label, sl_price, target_price = get_option_strike_params(
+            # Contract Pricing Integration
+            option_contract, opt_price, opt_sl, opt_target, opt_tsl = get_option_contract_pricing(
                 sym, curr_price, signal, st.session_state["default_sl_pct"], st.session_state["rr_ratio"]
             )
 
@@ -537,10 +533,12 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
                 "_RawCandleTime": candle_ts_str,
                 "Ticker": sym,
                 "Signal": signal,
-                "Option Strike": strike_label,
-                "Price (₹)": round(curr_price, 2),
-                "Stop Loss (₹)": sl_price,
-                "Target (1:2.5 RR) (₹)": target_price,
+                "Option Contract": option_contract,
+                "Option Price (₹)": opt_price,
+                "Stop Loss (₹)": opt_sl,
+                "Trailing SL (₹)": opt_tsl,
+                "Target (1:2.5 RR) (₹)": opt_target,
+                "Spot Price (₹)": round(curr_price, 2),
                 "Change (%)": round(change_pct, 2),
                 "RSI (14)": round(rsi_14, 1),
                 "Vol/OI Ratio": real_vol_oi,
@@ -558,7 +556,7 @@ fno_universe = fetch_dhan_fno_universe()
 # 5. SIDEBAR CONTROLS
 # ==========================================
 with st.sidebar:
-    st.markdown("### ⚡ Apex PDH/PDL & Impulse Center")
+    st.markdown("### ⚡ Apex Contract Option Center")
     st.caption(f"Clean Equity Universe: **{len(fno_universe)}** Equities")
     st.divider()
 
@@ -593,7 +591,7 @@ with st.sidebar:
         st.rerun()
 
 # Run Multi-Timeframe Screener
-with st.spinner(f"Computing PDH/PDL Structure & Impulse Signals for {selected_timeframe}..."):
+with st.spinner(f"Computing Contract Pricing & Signals for {selected_timeframe}..."):
     df_raw = compute_master_signals(
         fno_universe, 
         selected_timeframe,
@@ -618,14 +616,14 @@ if not filtered_df.empty:
     if search_ticker:
         filtered_df = filtered_df[filtered_df["Ticker"].str.contains(search_ticker)]
 
-# Dispatch Telegram Alerts (Strictly BUY CE & BUY PE)
+# Dispatch Telegram Alerts
 if st.session_state["tg_connected"] and not filtered_df.empty:
     dispatch_deduplicated_alerts(filtered_df, TIMEFRAME_MAP[selected_timeframe]["label"])
 
 # ==========================================
 # 6. MAIN DASHBOARD PANELS
 # ==========================================
-st.title(f"⚡ Apex PDH/PDL Impulse Dashboard ({selected_timeframe})")
+st.title(f"⚡ Apex Contract Option Dashboard ({selected_timeframe})")
 
 tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders = st.tabs([
     "📋 Live Screener", 
@@ -641,7 +639,7 @@ tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders 
 # TAB 1: SCREENER & ORDER TERMINAL
 # ------------------------------------------------------------------
 with tab_screener:
-    st.subheader(f"PDH/PDL & Opening Impulse Signals ({selected_timeframe} Candles)")
+    st.subheader(f"Option Contract Signals & Premium Tracking ({selected_timeframe} Candles)")
 
     k1, k2, k3, k4 = st.columns(4)
     total_m = len(filtered_df)
@@ -658,13 +656,15 @@ with tab_screener:
     col_table, col_action = st.columns([2, 1])
 
     with col_table:
-        st.markdown(f"##### Verified Option Signal Directory ({selected_timeframe})")
+        st.markdown(f"##### Verified Option Contract Directory ({selected_timeframe})")
         if not filtered_df.empty:
             st.dataframe(
                 filtered_df.style.format({
-                    "Price (₹)": "₹{:.2f}",
+                    "Option Price (₹)": "₹{:.2f}",
                     "Stop Loss (₹)": "₹{:.2f}",
+                    "Trailing SL (₹)": "₹{:.2f}",
                     "Target (1:2.5 RR) (₹)": "₹{:.2f}",
+                    "Spot Price (₹)": "₹{:.2f}",
                     "Change (%)": "{:+.2f}%",
                     "RSI (14)": "{:.1f}",
                     "Vol/OI Ratio": "{:.2f}",
@@ -677,7 +677,7 @@ with tab_screener:
                 height=450
             )
         else:
-            st.info(f"No signals match criteria for {selected_timeframe}. Waiting for structural breakout.")
+            st.info(f"No contract signals match criteria for {selected_timeframe}. Waiting for structure.")
 
     with col_action:
         st.markdown("##### ⚡ Order Execution Panel")
@@ -689,21 +689,25 @@ with tab_screener:
             ref_df = filtered_df if not filtered_df.empty else df_screener
             stock_row = ref_df[ref_df["Ticker"] == selected_stock].iloc[0]
             sig_time = str(stock_row["Signal Timestamp"])
-            price = float(stock_row["Price (₹)"])
+            opt_contract = str(stock_row["Option Contract"])
+            opt_price = float(stock_row["Option Price (₹)"])
             signal = str(stock_row["Signal"])
-            strike = str(stock_row["Option Strike"])
             sl = float(stock_row["Stop Loss (₹)"])
+            tsl = float(stock_row["Trailing SL (₹)"])
             target = float(stock_row["Target (1:2.5 RR) (₹)"])
+            spot = float(stock_row["Spot Price (₹)"])
             
-            qty, risk_amt, _, _ = calculate_position_size(price, st.session_state["default_sl_pct"])
+            qty, risk_amt = calculate_position_size(opt_price, sl)
 
             st.success(f"**Target:** {selected_stock} | **Signal:** {signal} ({selected_timeframe})")
             st.write(f"• **Signal Triggered At:** `{sig_time}`")
-            st.write(f"• **Recommended Strike:** `{strike}`")
-            st.write(f"• **Spot Entry Price:** ₹{price}")
+            st.write(f"• **Option Contract:** `{opt_contract}`")
+            st.write(f"• **Contract Entry Price:** ₹{opt_price}")
             st.write(f"• **Stop Loss (SL):** ₹{sl}")
+            st.write(f"• **Trailing SL (TSL):** ₹{tsl}")
             st.write(f"• **Target (1:2.5 RR):** ₹{target}")
-            st.write(f"• **Position Size:** `{qty}` Shares")
+            st.write(f"• **Underlying Spot:** ₹{spot}")
+            st.write(f"• **Position Size:** `{qty}` Units")
             st.write(f"• **Capital Risk:** ₹{risk_amt:,.2f}")
 
             st.write("")
@@ -715,38 +719,39 @@ with tab_screener:
                         "Time": sig_time,
                         "Timeframe": selected_timeframe,
                         "Symbol": selected_stock,
-                        "Strike": strike,
+                        "Contract": opt_contract,
                         "Type": signal,
                         "Qty": qty,
-                        "Entry Price": price,
-                        "SL": sl,
-                        "Target": target,
+                        "Contract Entry (₹)": opt_price,
+                        "Stop Loss (₹)": sl,
+                        "Trailing SL (₹)": tsl,
+                        "Target (₹)": target,
                         "Status": "OPEN"
                     }
                     st.session_state["paper_trade_log"].append(paper_entry)
-                    st.success(f"Paper Order Placed for {strike}!")
+                    st.success(f"Paper Contract Order Placed for {opt_contract}!")
 
             with col_l:
                 if st.button("🚀 1-Click Live Trade", use_container_width=True, type="primary"):
                     if not st.session_state["dhan_authenticated"]:
                         st.error("Authenticate Dhan API in Tab 3 first!")
                     else:
-                        success, order_info = execute_dhan_live_order(selected_stock, qty, "BUY", price)
+                        success, order_info = execute_dhan_live_order(selected_stock, qty, "BUY", opt_price)
                         if success:
                             live_entry = {
                                 "Time": sig_time,
                                 "OrderID": order_info,
                                 "Timeframe": selected_timeframe,
                                 "Symbol": selected_stock,
-                                "Strike": strike,
+                                "Contract": opt_contract,
                                 "Type": signal,
                                 "Qty": qty,
-                                "Price": price,
+                                "Contract Price (₹)": opt_price,
                                 "Status": "EXECUTED"
                             }
                             st.session_state["live_trade_log"].append(live_entry)
                             st.balloons()
-                            st.success(f"Live Order Submitted! ID: {order_info}")
+                            st.success(f"Live Option Order Submitted! ID: {order_info}")
                         else:
                             st.error(f"Execution Error: {order_info}")
         else:
@@ -756,16 +761,16 @@ with tab_screener:
 # TAB 2: INSTITUTIONAL JOURNAL & BACKTEST PERFORMANCE
 # ------------------------------------------------------------------
 with tab_journal:
-    st.subheader("📑 Institutional Trade Journal & Performance Analytics")
-    st.caption("PDH/PDL structural breakout executions with $1:2.5$ Risk-to-Reward ratio outcomes.")
+    st.subheader("📑 Institutional Trade Journal & Contract Analytics")
+    st.caption("Option contract execution logs and performance metrics based on premium risk-to-reward.")
 
     df_journal = pd.DataFrame(st.session_state["institutional_journal"])
     
     st.dataframe(
         df_journal.style.format({
-            "Entry Price": "₹{:,.2f}",
-            "Stop Loss": "₹{:,.2f}",
-            "Target (1:2.5 RR)": "₹{:,.2f}"
+            "Contract Entry (₹)": "₹{:,.2f}",
+            "Stop Loss (₹)": "₹{:,.2f}",
+            "Target (₹)": "₹{:,.2f}"
         }),
         use_container_width=True
     )
@@ -809,7 +814,7 @@ with tab_dhan:
 # ------------------------------------------------------------------
 with tab_tg:
     st.subheader("📱 Telegram Notification Engine")
-    st.caption("Broadcasts alerts exclusively for verified BUY CE and BUY PE structural signals.")
+    st.caption("Broadcasts alerts exclusively for verified contract-level BUY CE and BUY PE signals.")
 
     col_tg_cfg, col_tg_test = st.columns([2, 1])
 
@@ -832,7 +837,7 @@ with tab_tg:
             if not st.session_state["tg_connected"]:
                 st.error("Configure Bot Token & Chat ID first.")
             else:
-                ok = send_telegram_alert(f"✅ <b>Apex Algo:</b> PDH/PDL Telegram System Active! Active Timeframe: {selected_timeframe}")
+                ok = send_telegram_alert(f"✅ <b>Apex Algo:</b> Contract Telegram System Active! Active Timeframe: {selected_timeframe}")
                 if ok: st.success("Test Delivered!")
                 else: st.error("Delivery Failed.")
 
