@@ -4,7 +4,7 @@ import numpy as np
 import requests
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 import yfinance as yf
 
 # ==========================================
@@ -342,9 +342,9 @@ def calculate_position_size(price, sl_pct):
     target_price = round(price + (sl_per_share * st.session_state["rr_ratio"]), 2)
     return qty, risk_amt, sl_price, target_price
 
-# Helper: Persistent Candle Timestamp Attacher
+# Helper: Persistent Market-Hour Timestamp Attacher
 def attach_persistent_timestamps(df, tf_label):
-    """Retains initial trigger timestamp per signal across refreshes while using true market candle timestamps."""
+    """Retains initial trigger timestamp per signal across refreshes while ensuring market hours adherence."""
     if df.empty:
         return df
 
@@ -432,12 +432,25 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
             change_pct = float(((curr_price - prev_price) / prev_price) * 100)
             volume = float(df_stock['Volume'].iloc[-1])
 
-            # Extract Actual Candle Timestamp directly from Market Data
+            # Extract Actual Candle Timestamp and strictly enforce Indian Market Hours (09:15:00 to 15:30:00)
             last_candle_idx = df_stock.index[-1]
-            if hasattr(last_candle_idx, 'strftime'):
-                candle_ts_str = last_candle_idx.strftime("%d-%b-%Y %H:%M:%S")
+            if isinstance(last_candle_idx, pd.Timestamp):
+                dt_val = last_candle_idx.to_pydatetime()
             else:
-                candle_ts_str = str(last_candle_idx)
+                try:
+                    dt_val = pd.to_datetime(last_candle_idx).to_pydatetime()
+                except Exception:
+                    dt_val = datetime.now()
+
+            market_open = dt_val.replace(hour=9, minute=15, second=0, microsecond=0)
+            market_close = dt_val.replace(hour=15, minute=30, second=0, microsecond=0)
+
+            if dt_val > market_close:
+                dt_val = market_close
+            elif dt_val < market_open:
+                dt_val = market_open
+
+            candle_ts_str = dt_val.strftime("%d-%b-%Y %H:%M:%S")
 
             # 1. Technical Indicators Aligned to Active Timeframe
             delta = close.diff()
