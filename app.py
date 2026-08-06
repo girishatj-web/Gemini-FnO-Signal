@@ -1,12 +1,13 @@
 import os
 import sys
 
-# --- AUTOMATIC PACKAGE RECOVERY FOR STREAMLIT CLOUD ---
+# --- GUARANTEED STREAMLIT CLOUD AUTO-INSTALLER ---
 try:
     from dhanhq import dhanhq
-except ModuleNotFoundError:
-    # Uses uv / ensurepip compatible invocation
-    os.system("uv pip install dhanhq pandas numpy requests || python -m pip install dhanhq pandas numpy requests")
+except ImportError:
+    # Executes uv pip install directly inside Streamlit Cloud's venv
+    os.system("uv pip install dhanhq pandas numpy requests")
+    os.system(f"{sys.executable} -m pip install dhanhq pandas numpy requests")
     from dhanhq import dhanhq
 
 import concurrent.futures
@@ -17,7 +18,6 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-
 
 # ==========================================
 # 1. DATABASE INITIALIZATION (SQLite)
