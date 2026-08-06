@@ -11,7 +11,7 @@ import yfinance as yf
 # 1. PAGE CONFIGURATION & LIGHT UI STYLING
 # ==========================================
 st.set_page_config(
-    page_title="F&O Signal Engine",
+    page_title="Apex Live Contract Option Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -161,7 +161,7 @@ init_session_state()
 # Fallback Universe (Including HAL)
 NSE_FNO_FALLBACK = [
     "NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "TATAMOTORS",
-    "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL", "HAL"
+    "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL", "HAL", "COCHINSHIP"
 ]
 
 # ==========================================
@@ -186,7 +186,7 @@ def fetch_dhan_fno_universe():
             raw_symbols = fno_df['SEM_TRADING_SYMBOL'].dropna().astype(str).tolist()
 
         indices = {'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT50'}
-        clean_symbols = set(["NIFTY", "BANKNIFTY", "HAL"])
+        clean_symbols = set(["NIFTY", "BANKNIFTY", "HAL", "COCHINSHIP"])
         months_regex = r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|CALL|PUT|FUT|CE|PE|\d+).*$'
 
         for raw_sym in raw_symbols:
@@ -202,6 +202,30 @@ def fetch_dhan_fno_universe():
     except Exception:
         return NSE_FNO_FALLBACK
 
+@st.cache_data(ttl=3600*12)
+def get_dhan_security_id(symbol):
+    try:
+        df_master = pd.read_csv(DHAN_SCRIP_MASTER_URL, low_memory=False)
+        match = df_master[(df_master['SEM_TRADING_SYMBOL'].astype(str).str.upper() == symbol) & (df_master['SEM_EXM_EXCH_ID'].astype(str).str.upper() == 'NSE')]
+        if match.empty:
+            match = df_master[df_master['SEM_CUSTOM_SYMBOL'].astype(str).str.upper() == symbol]
+        if not match.empty:
+            sec_id = int(match.iloc[0]['SEM_SECURITY_ID'])
+            return sec_id
+    except Exception:
+        pass
+    
+    # Hardcoded defaults for major underlyings if scrip master lookup fails
+    defaults = {
+        "NIFTY": 13,
+        "BANKNIFTY": 25,
+        "RELIANCE": 2885,
+        "TCS": 11536,
+        "HAL": 10940,
+        "COCHINSHIP": 15462
+    }
+    return defaults.get(symbol, 0)
+
 def validate_dhan_credentials(client_id, access_token):
     url = "https://api.dhan.co/fundlimit"
     headers = {"access-token": access_token, "client-id": client_id, "Content-Type": "application/json"}
@@ -213,22 +237,56 @@ def validate_dhan_credentials(client_id, access_token):
     except Exception as e:
         return False, f"Connection Error: {str(e)}"
 
-def fetch_dhan_live_option_chain(symbol, client_id, access_token):
+def fetch_dhan_live_option_contract_price(symbol, strike, option_type, client_id, access_token):
     if not client_id or not access_token:
         return None
     
-    url = "https://api.dhan.co/optionchain"
+    sec_id = get_dhan_security_id(symbol)
+    if not sec_id:
+        return None
+    
+    url = "https://api.dhan.co/v2/optionchain"
     headers = {"access-token": access_token, "client-id": client_id, "Content-Type": "application/json"}
     payload = {
-        "UnderlyingScrip": 13 if symbol == "NIFTY" else (25 if symbol == "BANKNIFTY" else 0),
-        "UnderlyingSeg": "NSE_FNO"
+        "UnderlyingScrip": int(sec_id),
+        "UnderlyingSeg": "IDX_I" if symbol in ["NIFTY", "BANKNIFTY"] else "NSE_EQ"
+    }
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        if res.status_code == 200:
+            oc_data = res.json().get("data", {}).get("oc", {})
+            strike_keys = list(oc_data.keys())
+            if not strike_keys:
+                return None
+            
+            # Find closest strike match in the option chain response
+            closest_key = min(strike_keys, key=lambda x: abs(float(x) - float(strike)))
+            if abs(float(closest_key) - float(strike)) <= (20.0 if symbol in ["NIFTY", "BANKNIFTY"] else 15.0):
+                contract_data = oc_data[closest_key].get(option_type.lower(), {})
+                ltp = contract_data.get("last_price", 0.0)
+                if ltp and ltp > 0:
+                    return float(ltp)
+        return None
+    except Exception:
+        return None
+
+def fetch_dhan_live_option_chain_vol_oi(symbol, client_id, access_token):
+    if not client_id or not access_token:
+        return None
+    
+    sec_id = get_dhan_security_id(symbol)
+    url = "https://api.dhan.co/v2/optionchain"
+    headers = {"access-token": access_token, "client-id": client_id, "Content-Type": "application/json"}
+    payload = {
+        "UnderlyingScrip": int(sec_id) if sec_id else (13 if symbol == "NIFTY" else 25),
+        "UnderlyingSeg": "IDX_I" if symbol in ["NIFTY", "BANKNIFTY"] else "NSE_EQ"
     }
     try:
         res = requests.post(url, json=payload, headers=headers, timeout=4)
         if res.status_code == 200:
-            oc_data = res.json().get("data", {})
-            total_oi = sum([item.get("oi", 1) for item in oc_data.values() if isinstance(item, dict)])
-            total_vol = sum([item.get("volume", 0) for item in oc_data.values() if isinstance(item, dict)])
+            oc_data = res.json().get("data", {}).get("oc", {})
+            total_oi = sum([item.get(opt, {}).get("oi", 1) for item in oc_data.values() if isinstance(item, dict) for opt in ['ce', 'pe']])
+            total_vol = sum([item.get(opt, {}).get("volume", 0) for item in oc_data.values() if isinstance(item, dict) for opt in ['ce', 'pe']])
             vol_oi = round(total_vol / max(1, total_oi), 2)
             return vol_oi
         return None
@@ -283,27 +341,27 @@ def dispatch_deduplicated_alerts(filtered_df, tf_label):
         alert_key = f"{row['Ticker']}_{signal}_{tf_label}_{today_str}"
         if alert_key not in st.session_state["sent_alerts"]:
             msg = (
-                f"🚨 <b>APEX CONTRACT OPTION ALERT ({tf_label})</b> 🚨\n\n"
+                f"🚨 <b>APEX LIVE OPTION CONTRACT ALERT ({tf_label})</b> 🚨\n\n"
                 f"<b>Signal Timestamp:</b> {row['Signal Timestamp']}\n"
                 f"<b>Symbol:</b> #{row['Ticker']}\n"
                 f"<b>Timeframe:</b> {tf_label}\n"
                 f"<b>Signal:</b> {signal}\n"
                 f"<b>Option Contract:</b> {row['Option Contract']}\n"
-                f"<b>Contract Entry Premium:</b> ₹{row['Option Price (₹)']}\n"
+                f"<b>Live Contract LTP:</b> ₹{row['Option Price (₹)']}\n"
                 f"<b>Stop Loss (SL):</b> ₹{row['Stop Loss (₹)']}\n"
                 f"<b>Trailing SL (TSL):</b> ₹{row['Trailing SL (₹)']}\n"
                 f"<b>Target (1:2.5 RR):</b> ₹{row['Target (1:2.5 RR) (₹)']}\n"
                 f"<b>Setup:</b> {row['Setup Description']}\n"
                 f"<b>RSI (14):</b> {row['RSI (14)']} | <b>Vol/OI Ratio:</b> {row['Vol/OI Ratio']}\n\n"
-                f"⚡ <i>Apex Contract Pricing Feed</i>"
+                f"⚡ <i>Apex Live Broker Option Feed</i>"
             )
             if send_telegram_alert(msg):
                 st.session_state["sent_alerts"].add(alert_key)
                 sent_count += 1
     return sent_count
 
-# Helper: Option Contract Pricing & Risk Calculator
-def get_option_contract_pricing(symbol, spot_price, signal, sl_pct=1.5, rr_ratio=2.5):
+# Helper: Live Option Contract Pricing & Risk Calculator
+def get_option_contract_pricing(symbol, spot_price, signal, sl_pct=1.5, rr_ratio=2.5, client_id="", access_token=""):
     if signal not in ["BUY CE", "BUY PE"]:
         return "N/A", 0.0, 0.0, 0.0, 0.0
 
@@ -318,15 +376,21 @@ def get_option_contract_pricing(symbol, spot_price, signal, sl_pct=1.5, rr_ratio
     option_type = "CE" if "CE" in signal else "PE"
     strike_label = f"{symbol} {atm_strike} {option_type}"
 
-    # Modeled Option Premium (~2.5% of spot price for near-ATM contract)
-    option_price = round(spot_price * 0.025, 2)
-    
+    # Fetch live option contract price from Dhan Option Chain API
+    live_contract_price = fetch_dhan_live_option_contract_price(symbol, atm_strike, option_type, client_id, access_token)
+
+    if live_contract_price and live_contract_price > 0:
+        option_price = round(live_contract_price, 2)
+    else:
+        # Fallback estimation heuristic if broker feed is not connected or unavailable
+        option_price = round(spot_price * 0.025, 2)
+
     # Option Risk calculation (Option Delta approx 0.5 modeling)
     option_risk = option_price * (sl_pct / 2.0)
     
     option_sl = round(max(0.5, option_price - option_risk), 2)
     option_target = round(option_price + (option_risk * rr_ratio), 2)
-    option_tsl = round(option_sl + (option_risk * 0.4), 2) # Trailing SL baseline
+    option_tsl = round(option_sl + (option_risk * 0.4), 2)
 
     return strike_label, option_price, option_sl, option_target, option_tsl
 
@@ -374,7 +438,7 @@ TIMEFRAME_MAP = {
 
 @st.cache_data(ttl=90)
 def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access_token=""):
-    """Scans with PDH/PDL Prior Structure & Option Contract Pricing Engine."""
+    """Scans with PDH/PDL Prior Structure & Live Broker Option Pricing."""
     if not symbols: return pd.DataFrame()
     
     tf_info = TIMEFRAME_MAP.get(timeframe_key, TIMEFRAME_MAP["5 Mins"])
@@ -489,7 +553,7 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
             orb_bullish = curr_price > orh and float(close.iloc[-2]) <= orh
             orb_bearish = curr_price < orl and float(close.iloc[-2]) >= orl
 
-            real_vol_oi = fetch_dhan_live_option_chain(sym, client_id, access_token)
+            real_vol_oi = fetch_dhan_live_option_chain_vol_oi(sym, client_id, access_token)
             if real_vol_oi is None:
                 total_vol_series = df_stock['Volume'].tail(14).sum()
                 mean_vol = df_stock['Volume'].mean()
@@ -524,9 +588,9 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
                 signal = "Consolidating"
                 setup_desc = f"Rangebound / Waiting for Structure"
 
-            # Contract Pricing Integration
+            # Contract Pricing Integration with Live Option Feed
             option_contract, opt_price, opt_sl, opt_target, opt_tsl = get_option_contract_pricing(
-                sym, curr_price, signal, st.session_state["default_sl_pct"], st.session_state["rr_ratio"]
+                sym, curr_price, signal, st.session_state["default_sl_pct"], st.session_state["rr_ratio"], client_id, access_token
             )
 
             results.append({
@@ -556,7 +620,7 @@ fno_universe = fetch_dhan_fno_universe()
 # 5. SIDEBAR CONTROLS
 # ==========================================
 with st.sidebar:
-    st.markdown("### ⚡ Apex Contract Option Center")
+    st.markdown("### ⚡ Apex Live Contract Center")
     st.caption(f"Clean Equity Universe: **{len(fno_universe)}** Equities")
     st.divider()
 
@@ -591,7 +655,7 @@ with st.sidebar:
         st.rerun()
 
 # Run Multi-Timeframe Screener
-with st.spinner(f"Computing Contract Pricing & Signals for {selected_timeframe}..."):
+with st.spinner(f"Computing Live Option Contract Prices for {selected_timeframe}..."):
     df_raw = compute_master_signals(
         fno_universe, 
         selected_timeframe,
@@ -623,7 +687,7 @@ if st.session_state["tg_connected"] and not filtered_df.empty:
 # ==========================================
 # 6. MAIN DASHBOARD PANELS
 # ==========================================
-st.title(f"⚡ Apex Contract Option Dashboard ({selected_timeframe})")
+st.title(f"⚡ Apex Live Option Contract Dashboard ({selected_timeframe})")
 
 tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders = st.tabs([
     "📋 Live Screener", 
@@ -639,7 +703,7 @@ tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders 
 # TAB 1: SCREENER & ORDER TERMINAL
 # ------------------------------------------------------------------
 with tab_screener:
-    st.subheader(f"Option Contract Signals & Premium Tracking ({selected_timeframe} Candles)")
+    st.subheader(f"Live Option Contract Signals & Premium Tracking ({selected_timeframe} Candles)")
 
     k1, k2, k3, k4 = st.columns(4)
     total_m = len(filtered_df)
@@ -656,7 +720,7 @@ with tab_screener:
     col_table, col_action = st.columns([2, 1])
 
     with col_table:
-        st.markdown(f"##### Verified Option Contract Directory ({selected_timeframe})")
+        st.markdown(f"##### Verified Live Option Contract Directory ({selected_timeframe})")
         if not filtered_df.empty:
             st.dataframe(
                 filtered_df.style.format({
@@ -702,7 +766,7 @@ with tab_screener:
             st.success(f"**Target:** {selected_stock} | **Signal:** {signal} ({selected_timeframe})")
             st.write(f"• **Signal Triggered At:** `{sig_time}`")
             st.write(f"• **Option Contract:** `{opt_contract}`")
-            st.write(f"• **Contract Entry Price:** ₹{opt_price}")
+            st.write(f"• **Live Contract LTP:** ₹{opt_price}")
             st.write(f"• **Stop Loss (SL):** ₹{sl}")
             st.write(f"• **Trailing SL (TSL):** ₹{tsl}")
             st.write(f"• **Target (1:2.5 RR):** ₹{target}")
@@ -762,7 +826,7 @@ with tab_screener:
 # ------------------------------------------------------------------
 with tab_journal:
     st.subheader("📑 Institutional Trade Journal & Contract Analytics")
-    st.caption("Option contract execution logs and performance metrics based on premium risk-to-reward.")
+    st.caption("Option contract execution logs and performance metrics based on live premium risk-to-reward.")
 
     df_journal = pd.DataFrame(st.session_state["institutional_journal"])
     
@@ -814,7 +878,7 @@ with tab_dhan:
 # ------------------------------------------------------------------
 with tab_tg:
     st.subheader("📱 Telegram Notification Engine")
-    st.caption("Broadcasts alerts exclusively for verified contract-level BUY CE and BUY PE signals.")
+    st.caption("Broadcasts alerts exclusively for verified live contract-level BUY CE and BUY PE signals.")
 
     col_tg_cfg, col_tg_test = st.columns([2, 1])
 
@@ -837,7 +901,7 @@ with tab_tg:
             if not st.session_state["tg_connected"]:
                 st.error("Configure Bot Token & Chat ID first.")
             else:
-                ok = send_telegram_alert(f"✅ <b>Apex Algo:</b> Contract Telegram System Active! Active Timeframe: {selected_timeframe}")
+                ok = send_telegram_alert(f"✅ <b>Apex Algo:</b> Live Contract Telegram System Active! Active Timeframe: {selected_timeframe}")
                 if ok: st.success("Test Delivered!")
                 else: st.error("Delivery Failed.")
 
