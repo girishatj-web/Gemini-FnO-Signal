@@ -160,10 +160,10 @@ def init_session_state():
 
 init_session_state()
 
-# Fallback Universe
+# Fallback Universe (Including HAL)
 NSE_FNO_FALLBACK = [
     "NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "TATAMOTORS",
-    "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL"
+    "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL", "HAL"
 ]
 
 # ==========================================
@@ -188,7 +188,7 @@ def fetch_dhan_fno_universe():
             raw_symbols = fno_df['SEM_TRADING_SYMBOL'].dropna().astype(str).tolist()
 
         indices = {'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT50'}
-        clean_symbols = set(["NIFTY", "BANKNIFTY"])
+        clean_symbols = set(["NIFTY", "BANKNIFTY", "HAL"])
         months_regex = r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|CALL|PUT|FUT|CE|PE|\d+).*$'
 
         for raw_sym in raw_symbols:
@@ -215,7 +215,6 @@ def validate_dhan_credentials(client_id, access_token):
     except Exception as e:
         return False, f"Connection Error: {str(e)}"
 
-# REAL DHAN OPTION CHAIN & OPEN INTEREST FEED
 def fetch_dhan_live_option_chain(symbol, client_id, access_token):
     if not client_id or not access_token:
         return None
@@ -275,7 +274,6 @@ def send_telegram_alert(message):
         return False
 
 def dispatch_deduplicated_alerts(filtered_df, tf_label):
-    """Triggers Telegram notifications ONLY for BUY CE and BUY PE signals."""
     today_str = datetime.now().strftime("%Y-%m-%d")
     sent_count = 0
     
@@ -287,7 +285,7 @@ def dispatch_deduplicated_alerts(filtered_df, tf_label):
         alert_key = f"{row['Ticker']}_{signal}_{tf_label}_{today_str}"
         if alert_key not in st.session_state["sent_alerts"]:
             msg = (
-                f"🚨 <b>APEX CONFIRMED SIGNAL ALERT ({tf_label})</b> 🚨\n\n"
+                f"🚨 <b>APEX PDH/PDL & ORB ALERT ({tf_label})</b> 🚨\n\n"
                 f"<b>Signal Timestamp:</b> {row['Signal Timestamp']}\n"
                 f"<b>Symbol:</b> #{row['Ticker']}\n"
                 f"<b>Timeframe:</b> {tf_label}\n"
@@ -298,7 +296,7 @@ def dispatch_deduplicated_alerts(filtered_df, tf_label):
                 f"<b>Target (1:2.5 RR):</b> ₹{row['Target (1:2.5 RR) (₹)']}\n"
                 f"<b>Setup:</b> {row['Setup Description']}\n"
                 f"<b>RSI (14):</b> {row['RSI (14)']} | <b>Vol/OI Ratio:</b> {row['Vol/OI Ratio']}\n\n"
-                f"⚡ <i>Apex Multi-Timeframe Anti-Fakeout Feed</i>"
+                f"⚡ <i>Apex Multi-Structure Feed</i>"
             )
             if send_telegram_alert(msg):
                 st.session_state["sent_alerts"].add(alert_key)
@@ -378,7 +376,7 @@ TIMEFRAME_MAP = {
 
 @st.cache_data(ttl=90)
 def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access_token=""):
-    """Scans with strict anti-fakeout confluence rules to minimize false signals."""
+    """Scans with PDH/PDL Prior Structure Support & ORB Gap Rules."""
     if not symbols: return pd.DataFrame()
     
     tf_info = TIMEFRAME_MAP.get(timeframe_key, TIMEFRAME_MAP["5 Mins"])
@@ -459,20 +457,40 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
             sma_50 = float(close.rolling(50).mean().iloc[-1]) if len(df_stock) >= 50 else float(close.mean())
             sma_200 = float(close.rolling(200).mean().iloc[-1]) if len(df_stock) >= 200 else sma_50
 
-            # SMC Structure
-            prev_high_level = float(high.iloc[:-1].max())
-            prev_low_level = float(low.iloc[:-1].min())
+            # ====================================================
+            # PREVIOUS DAY STRUCTURE (PDH/PDL) & ORB LOGIC
+            # ====================================================
+            last_date = df_stock.index[-1].date()
+            past_df = df_stock[df_stock.index.date < last_date]
+            
+            if not past_df.empty:
+                prev_day_date = past_df.index.date[-1]
+                prev_day_candles = past_df[past_df.index.date == prev_day_date]
+                pdh = float(prev_day_candles['High'].max())
+                pdl = float(prev_day_candles['Low'].min())
+                prev_close = float(prev_day_candles['Close'].iloc[-1])
+            else:
+                pdh = float(high.iloc[0])
+                pdl = float(low.iloc[0])
+                prev_close = float(close.iloc[0])
 
-            is_high_sweep = float(high.iloc[-1]) > prev_high_level and curr_price < prev_high_level
-            is_low_sweep = float(low.iloc[-1]) < prev_low_level and curr_price > prev_low_level
+            today_df = df_stock[df_stock.index.date == last_date]
+            if not today_df.empty:
+                first_candle = today_df.iloc[0]
+                orh = float(first_candle['High'])
+                orl = float(first_candle['Low'])
+                day_open = float(first_candle['Open'])
+                gap_pct = ((day_open - prev_close) / prev_close) * 100
+            else:
+                orh = pdh
+                orl = pdl
+                gap_pct = 0.0
 
-            c1_high = float(high.iloc[-3])
-            c3_low = float(low.iloc[-1])
-            c1_low = float(low.iloc[-3])
-            c3_high = float(high.iloc[-1])
-
-            bullish_fvg = c3_low > c1_high
-            bearish_fvg = c3_high < c1_low
+            # Structural Breakouts: Combining Intraday ORB and Previous Day High/Low (PDH/PDL)
+            pdh_break = curr_price > pdh and float(close.iloc[-2]) <= pdh
+            pdl_break = curr_price < pdl and float(close.iloc[-2]) >= pdl
+            orb_bullish = curr_price > orh and float(close.iloc[-2]) <= orh
+            orb_bearish = curr_price < orl and float(close.iloc[-2]) >= orl
 
             # Vol / OI Feed
             real_vol_oi = fetch_dhan_live_option_chain(sym, client_id, access_token)
@@ -481,33 +499,35 @@ def compute_master_signals(symbols, timeframe_key="5 Mins", client_id="", access
                 mean_vol = df_stock['Volume'].mean()
                 real_vol_oi = round(float(total_vol_series / max(1.0, mean_vol * 10)), 2)
 
-            # ====================================================
-            # STRICT ANTI-FAKEOUT & FALSE SIGNAL FILTER LOGIC
-            # ====================================================
             is_uptrend = curr_price > sma_50
             is_downtrend = curr_price < sma_50
-            strong_volume = real_vol_oi >= 2.0  # Raised threshold to filter weak noise
-            price_confirm_bull = curr_price > prev_price  # Must confirm upward candle continuation
-            price_confirm_bear = curr_price < prev_price  # Must confirm downward candle continuation
+            strong_volume = real_vol_oi >= 1.5
 
-            if (is_low_sweep or bullish_fvg) and is_uptrend and strong_volume and price_confirm_bull and (45 <= rsi_14 <= 70):
+            # 2% Gap Rule Enforcement
+            is_extreme_gap_up = gap_pct > 2.0
+            allow_ce_signal = True
+            if is_extreme_gap_up and not (orb_bullish or pdh_break) and len(today_df) <= 3:
+                allow_ce_signal = False
+
+            # Signal Classifier with PDH/PDL & ORB Integration
+            if (pdh_break or orb_bullish or (curr_price > pdh and is_uptrend)) and allow_ce_signal and strong_volume and (45 <= rsi_14 <= 75):
                 signal = "BUY CE"
-                setup_desc = f"{tf_label} Confirmed Bullish FVG/Sweep + SMA 50 + Vol/OI"
-            elif (is_high_sweep or bearish_fvg) and is_downtrend and strong_volume and price_confirm_bear and (30 <= rsi_14 <= 55):
+                setup_desc = f"{tf_label} PDH Break / ORB Impulse + Volume Confirmation"
+            elif (pdl_break or orb_bearish) and is_downtrend and strong_volume and (25 <= rsi_14 <= 55):
                 signal = "BUY PE"
-                setup_desc = f"{tf_label} Confirmed Bearish FVG/Sweep + SMA 50 + Vol/OI"
-            elif rsi_14 < 35 and is_uptrend and price_confirm_bull:
+                setup_desc = f"{tf_label} PDL Breakdown / ORB Structure"
+            elif rsi_14 < 35 and is_uptrend and curr_price > prev_price:
                 signal = "Bullish Oversold"
                 setup_desc = f"Confirmed Oversold Bounce ({tf_label} RSI + SMA 50)"
-            elif is_uptrend and sma_50 > sma_200 and price_confirm_bull:
+            elif is_uptrend and sma_50 > sma_200 and curr_price > prev_price:
                 signal = "Strong Uptrend"
                 setup_desc = f"Verified Trend Alignment (50 > 200 SMA)"
-            elif is_downtrend and sma_50 < sma_200 and price_confirm_bear:
+            elif is_downtrend and sma_50 < sma_200 and curr_price < prev_price:
                 signal = "Downtrend Breakdown"
                 setup_desc = f"Verified Bearish Breakdown"
             else:
                 signal = "Consolidating"
-                setup_desc = f"Filtered Out (Waiting for Confluence)"
+                setup_desc = f"Rangebound / Waiting for PDH/PDL Structure"
 
             strike_label, sl_price, target_price = get_option_strike_params(
                 sym, curr_price, signal, st.session_state["default_sl_pct"], st.session_state["rr_ratio"]
@@ -538,7 +558,7 @@ fno_universe = fetch_dhan_fno_universe()
 # 5. SIDEBAR CONTROLS
 # ==========================================
 with st.sidebar:
-    st.markdown("### ⚡ Apex Anti-Fakeout Center")
+    st.markdown("### ⚡ Apex PDH/PDL & Impulse Center")
     st.caption(f"Clean Equity Universe: **{len(fno_universe)}** Equities")
     st.divider()
 
@@ -556,13 +576,13 @@ with st.sidebar:
     selected_timeframe = st.selectbox(
         "Select Candle Duration", 
         ["5 Mins", "10 Mins", "15 Mins", "1 Hour", "1 Day"], 
-        index=2  # Default to 15 Mins for cleaner filtering
+        index=0
     )
     st.divider()
 
     st.markdown("#### 🔍 Filter Criteria")
     selected_signal = st.selectbox("Signal Classifier", ["BUY CE & PE Only", "BUY CE", "BUY PE", "All Signals", "Bullish Oversold", "Strong Uptrend", "Downtrend Breakdown", "Consolidating"], index=0)
-    min_vol_oi = st.slider("Min Vol/OI Ratio Threshold", 1.0, 4.0, 2.0, 0.1)
+    min_vol_oi = st.slider("Min Vol/OI Ratio Threshold", 1.0, 4.0, 1.5, 0.1)
     rsi_range = st.slider(f"{selected_timeframe} RSI Range", 0.0, 100.0, (0.0, 100.0))
     search_ticker = st.text_input("Find Symbol", "").upper().strip()
 
@@ -573,7 +593,7 @@ with st.sidebar:
         st.rerun()
 
 # Run Multi-Timeframe Screener
-with st.spinner(f"Computing Filtered {selected_timeframe} Candles & Confluence Checks..."):
+with st.spinner(f"Computing PDH/PDL Structure & Impulse Signals for {selected_timeframe}..."):
     df_raw = compute_master_signals(
         fno_universe, 
         selected_timeframe,
@@ -605,7 +625,7 @@ if st.session_state["tg_connected"] and not filtered_df.empty:
 # ==========================================
 # 6. MAIN DASHBOARD PANELS
 # ==========================================
-st.title(f"⚡ Apex Confirmed Signal Dashboard ({selected_timeframe})")
+st.title(f"⚡ Apex PDH/PDL Impulse Dashboard ({selected_timeframe})")
 
 tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders = st.tabs([
     "📋 Live Screener", 
@@ -621,7 +641,7 @@ tab_screener, tab_journal, tab_dhan, tab_tg, tab_risk, tab_autoscan, tab_orders 
 # TAB 1: SCREENER & ORDER TERMINAL
 # ------------------------------------------------------------------
 with tab_screener:
-    st.subheader(f"Filtered High-Confluence Signals ({selected_timeframe} Candles)")
+    st.subheader(f"PDH/PDL & Opening Impulse Signals ({selected_timeframe} Candles)")
 
     k1, k2, k3, k4 = st.columns(4)
     total_m = len(filtered_df)
@@ -657,7 +677,7 @@ with tab_screener:
                 height=450
             )
         else:
-            st.info(f"No high-confluence signals match criteria for {selected_timeframe}. (This protects you from low-quality fakeouts).")
+            st.info(f"No signals match criteria for {selected_timeframe}. Waiting for structural breakout.")
 
     with col_action:
         st.markdown("##### ⚡ Order Execution Panel")
@@ -737,7 +757,7 @@ with tab_screener:
 # ------------------------------------------------------------------
 with tab_journal:
     st.subheader("📑 Institutional Trade Journal & Performance Analytics")
-    st.caption("Multi-timeframe FVG & SMC executions with $1:2.5$ Risk-to-Reward ratio outcomes.")
+    st.caption("PDH/PDL structural breakout executions with $1:2.5$ Risk-to-Reward ratio outcomes.")
 
     df_journal = pd.DataFrame(st.session_state["institutional_journal"])
     
@@ -789,7 +809,7 @@ with tab_dhan:
 # ------------------------------------------------------------------
 with tab_tg:
     st.subheader("📱 Telegram Notification Engine")
-    st.caption("Broadcasts alerts exclusively for verified BUY CE and BUY PE signals.")
+    st.caption("Broadcasts alerts exclusively for verified BUY CE and BUY PE structural signals.")
 
     col_tg_cfg, col_tg_test = st.columns([2, 1])
 
@@ -812,7 +832,7 @@ with tab_tg:
             if not st.session_state["tg_connected"]:
                 st.error("Configure Bot Token & Chat ID first.")
             else:
-                ok = send_telegram_alert(f"✅ <b>Apex Algo:</b> Anti-Fakeout Telegram System Active! Active Timeframe: {selected_timeframe}")
+                ok = send_telegram_alert(f"✅ <b>Apex Algo:</b> PDH/PDL Telegram System Active! Active Timeframe: {selected_timeframe}")
                 if ok: st.success("Test Delivered!")
                 else: st.error("Delivery Failed.")
 
