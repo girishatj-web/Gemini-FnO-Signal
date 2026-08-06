@@ -1,3 +1,14 @@
+import os
+import sys
+
+# --- AUTOMATIC PACKAGE RECOVERY FOR STREAMLIT CLOUD ---
+try:
+    from dhanhq import dhanhq
+except ModuleNotFoundError:
+    # Uses uv / ensurepip compatible invocation
+    os.system("uv pip install dhanhq pandas numpy requests || python -m pip install dhanhq pandas numpy requests")
+    from dhanhq import dhanhq
+
 import concurrent.futures
 import datetime
 import math
@@ -6,7 +17,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from dhanhq import dhanhq
+
 
 # ==========================================
 # 1. DATABASE INITIALIZATION (SQLite)
