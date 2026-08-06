@@ -135,6 +135,9 @@ def init_session_state():
     if "tg_connected" not in st.session_state: st.session_state["tg_connected"] = False
     if "sent_alerts" not in st.session_state: st.session_state["sent_alerts"] = set()
 
+    # PERSISTENT SIGNAL TIMESTAMPS CACHE
+    if "signal_timestamps" not in st.session_state: st.session_state["signal_timestamps"] = {}
+
     if "total_capital" not in st.session_state: st.session_state["total_capital"] = 200000.0
     if "risk_per_trade_pct" not in st.session_state: st.session_state["risk_per_trade_pct"] = 1.0
     if "default_sl_pct" not in st.session_state: st.session_state["default_sl_pct"] = 1.5
@@ -146,10 +149,10 @@ def init_session_state():
 
     if "institutional_journal" not in st.session_state: 
         st.session_state["institutional_journal"] = [
-            {"Date / Time": "Aug 5 (Morning Session)", "Symbol": "NIFTY", "Signal": "BUY CE", "Option Strike": "NIFTY 24200 CE", "Entry Price": 24180.0, "Stop Loss": 24140.0, "Target (1:2.5 RR)": 24280.0, "Outcome": "TARGET HIT 🎯"},
-            {"Date / Time": "Aug 5 (Afternoon Session)", "Symbol": "BANKNIFTY", "Signal": "BUY PE", "Option Strike": "BANKNIFTY 51500 PE", "Entry Price": 51450.0, "Stop Loss": 51600.0, "Target (1:2.5 RR)": 51075.0, "Outcome": "STOP LOSS HIT ❌"},
-            {"Date / Time": "Aug 6 (Opening Range)", "Symbol": "NIFTY", "Signal": "BUY CE", "Option Strike": "NIFTY 24200 CE", "Entry Price": 24220.0, "Stop Loss": 24180.0, "Target (1:2.5 RR)": 24320.0, "Outcome": "TARGET HIT 🎯"},
-            {"Date / Time": "Aug 6 (Midday Retest)", "Symbol": "RELIANCE", "Signal": "BUY PE", "Option Strike": "RELIANCE 2980 PE", "Entry Price": 2980.0, "Stop Loss": 2995.0, "Target (1:2.5 RR)": 2942.0, "Outcome": "TARGET HIT 🎯"},
+            {"Date / Time": "05-Aug-2026 09:30:00", "Symbol": "NIFTY", "Signal": "BUY CE", "Option Strike": "NIFTY 24200 CE", "Entry Price": 24180.0, "Stop Loss": 24140.0, "Target (1:2.5 RR)": 24280.0, "Outcome": "TARGET HIT 🎯"},
+            {"Date / Time": "05-Aug-2026 13:45:00", "Symbol": "BANKNIFTY", "Signal": "BUY PE", "Option Strike": "BANKNIFTY 51500 PE", "Entry Price": 51450.0, "Stop Loss": 51600.0, "Target (1:2.5 RR)": 51075.0, "Outcome": "STOP LOSS HIT ❌"},
+            {"Date / Time": "06-Aug-2026 09:20:00", "Symbol": "NIFTY", "Signal": "BUY CE", "Option Strike": "NIFTY 24200 CE", "Entry Price": 24220.0, "Stop Loss": 24180.0, "Target (1:2.5 RR)": 24320.0, "Outcome": "TARGET HIT 🎯"},
+            {"Date / Time": "06-Aug-2026 11:15:00", "Symbol": "RELIANCE", "Signal": "BUY PE", "Option Strike": "RELIANCE 2980 PE", "Entry Price": 2980.0, "Stop Loss": 2995.0, "Target (1:2.5 RR)": 2942.0, "Outcome": "TARGET HIT 🎯"},
         ]
 
     if "paper_trade_log" not in st.session_state: st.session_state["paper_trade_log"] = []
@@ -285,6 +288,7 @@ def dispatch_deduplicated_alerts(filtered_df, tf_label):
         if alert_key not in st.session_state["sent_alerts"]:
             msg = (
                 f"🚨 <b>APEX OPTION SIGNAL ALERT ({tf_label})</b> 🚨\n\n"
+                f"<b>Signal Timestamp:</b> {row['Signal Timestamp']}\n"
                 f"<b>Symbol:</b> #{row['Ticker']}\n"
                 f"<b>Timeframe:</b> {tf_label}\n"
                 f"<b>Signal:</b> {signal}\n"
@@ -337,6 +341,32 @@ def calculate_position_size(price, sl_pct):
     sl_price = round(price - sl_per_share, 2)
     target_price = round(price + (sl_per_share * st.session_state["rr_ratio"]), 2)
     return qty, risk_amt, sl_price, target_price
+
+# Helper: Persistent Signal Timestamp Attacher
+def attach_persistent_timestamps(df, tf_label):
+    """Ensures original signal timestamps persist across rescans and page refreshes."""
+    if df.empty:
+        return df
+
+    now_str = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
+    timestamps = []
+
+    for _, row in df.iterrows():
+        # Unique Signal Identifier
+        sig_key = f"{row['Ticker']}_{row['Signal']}_{tf_label}"
+
+        if sig_key in st.session_state["signal_timestamps"]:
+            # Retain original timestamp from initial trigger
+            ts = st.session_state["signal_timestamps"][sig_key]
+        else:
+            # First time seeing this active signal -> Store timestamp
+            ts = now_str
+            st.session_state["signal_timestamps"][sig_key] = ts
+
+        timestamps.append(ts)
+
+    df.insert(0, "Signal Timestamp", timestamps)
+    return df
 
 # ==========================================
 # 4. MULTI-TIMEFRAME SCANNING ENGINE
@@ -519,12 +549,14 @@ with st.sidebar:
 
 # Run Multi-Timeframe Screener
 with st.spinner(f"Computing {selected_timeframe} Candles, SMC Signals & Dhan Option Chain..."):
-    df_screener = compute_master_signals(
+    df_raw = compute_master_signals(
         fno_universe, 
         selected_timeframe,
         st.session_state["dhan_client_id"], 
         st.session_state["dhan_access_token"]
     )
+    # ATTACH PERSISTENT TIMESTAMPS
+    df_screener = attach_persistent_timestamps(df_raw, TIMEFRAME_MAP[selected_timeframe]["label"])
 
 filtered_df = df_screener.copy()
 
@@ -612,6 +644,7 @@ with tab_screener:
             
             ref_df = filtered_df if not filtered_df.empty else df_screener
             stock_row = ref_df[ref_df["Ticker"] == selected_stock].iloc[0]
+            sig_time = str(stock_row["Signal Timestamp"])
             price = float(stock_row["Price (₹)"])
             signal = str(stock_row["Signal"])
             strike = str(stock_row["Option Strike"])
@@ -621,6 +654,7 @@ with tab_screener:
             qty, risk_amt, _, _ = calculate_position_size(price, st.session_state["default_sl_pct"])
 
             st.success(f"**Target:** {selected_stock} | **Signal:** {signal} ({selected_timeframe})")
+            st.write(f"• **Signal Triggered At:** `{sig_time}`")
             st.write(f"• **Recommended Strike:** `{strike}`")
             st.write(f"• **Spot Entry Price:** ₹{price}")
             st.write(f"• **Stop Loss (SL):** ₹{sl}")
@@ -634,7 +668,7 @@ with tab_screener:
             with col_p:
                 if st.button("📄 Paper Trade", use_container_width=True):
                     paper_entry = {
-                        "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Time": sig_time,
                         "Timeframe": selected_timeframe,
                         "Symbol": selected_stock,
                         "Strike": strike,
@@ -656,7 +690,7 @@ with tab_screener:
                         success, order_info = execute_dhan_live_order(selected_stock, qty, "BUY", price)
                         if success:
                             live_entry = {
-                                "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "Time": sig_time,
                                 "OrderID": order_info,
                                 "Timeframe": selected_timeframe,
                                 "Symbol": selected_stock,
@@ -761,9 +795,10 @@ with tab_tg:
     st.divider()
     st.markdown("##### 🛡️ Alert Memory & Anti-Spam Cache")
     st.write(f"Unique BUY CE / BUY PE Alerts Sent Today: **{len(st.session_state['sent_alerts'])}**")
-    if st.button("Reset Alert Memory Cache"):
+    if st.button("Reset Alert Memory & Timestamp Cache"):
         st.session_state["sent_alerts"].clear()
-        st.success("Alert Memory Reset.")
+        st.session_state["signal_timestamps"].clear()
+        st.success("Alert Memory & Timestamp Cache Reset.")
 
 # ------------------------------------------------------------------
 # TAB 5: RISK MANAGEMENT ENGINE
