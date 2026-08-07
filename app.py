@@ -1,4 +1,3 @@
-
 import os
 import sys
 
@@ -9,6 +8,7 @@ except ImportError:
     os.system("uv pip install dhanhq pandas numpy requests")
     os.system(f"{sys.executable} -m pip install dhanhq pandas numpy requests")
     from dhanhq import dhanhq
+
 
 import concurrent.futures
 import datetime
