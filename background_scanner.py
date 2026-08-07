@@ -1,258 +1,151 @@
-import os
-import pandas as pd
+import concurrent.futures
+import datetime
+import sqlite3
 import numpy as np
+import pandas as pd
 import requests
-import re
-from datetime import datetime
-import yfinance as yf
-import json
+import streamlit as st
+from dhanhq import dhanhq
 
-# Load Environment Variables (Injected via GitHub Actions Secrets)
-DHAN_CLIENT_ID = os.environ.get("DHAN_CLIENT_ID", "")
-DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# ==========================================
+# 1. DATABASE INITIALIZATION (SQLite)
+# ==========================================
+DB_FILE = "trading_terminal.db"
 
-CACHE_FILE = "sent_alerts_cache.json"
+def init_db():
+    """Initializes local SQLite database tables for Signals, Paper Trades, and Journal."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS signal_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        symbol TEXT, signal TEXT, strike TEXT, spot_price REAL, entry_zone TEXT,
+        sl REAL, target REAL, setup_type TEXT)''')
 
-def load_sent_cache():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    return set()
+    c.execute('''CREATE TABLE IF NOT EXISTS paper_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        symbol TEXT, strike TEXT, trade_type TEXT, qty INTEGER, entry_price REAL,
+        exit_price REAL, pnl REAL, status TEXT DEFAULT 'OPEN')''')
 
-def save_sent_cache(sent_set):
+    c.execute('''CREATE TABLE IF NOT EXISTS trade_journal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        symbol TEXT, trade_type TEXT, entry_price REAL, exit_price REAL, qty INTEGER,
+        pnl REAL, setup_tag TEXT, rating INTEGER, notes TEXT)''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ==========================================
+# 2. STREAMLIT UI SETUP
+# ==========================================
+st.set_page_config(page_title="Institutional Options Terminal", layout="wide", initial_sidebar_state="expanded")
+
+st.markdown("""
+<style>
+    .main { background-color: #0d1117; color: #c9d1d9; }
+    .stButton>button { background-color: #238636; color: white; font-weight: bold; width: 100%; border-radius: 6px; }
+    .stButton>button:hover { background-color: #2ea043; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🏛️ Institutional Options Terminal & Journal")
+
+# Sidebar Controls
+st.sidebar.header("🔑 Dhan API Credentials")
+client_id = st.sidebar.text_input("Dhan Client ID", type="password")
+access_token = st.sidebar.text_input("Dhan Access Token", type="password")
+st.sidebar.markdown("---")
+timeframe = st.sidebar.selectbox("Analysis Timeframe", ["3", "5", "15"], index=1)
+
+FNO_UNIVERSE = ["NIFTY", "BANKNIFTY", "FINNIFTY", "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN"]
+
+# ==========================================
+# 3. CORE LOGIC
+# ==========================================
+@st.cache_data(ttl=86400)
+def fetch_dhan_scrip_master():
     try:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(list(sent_set), f)
+        df = pd.read_csv("https://images.dhan.co/api-data/api-scrip-master.csv", low_memory=False)
+        symbol_map = {}
+        index_alias = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK", "FINNIFTY": "NIFTY FIN SERVICE"}
+
+        for _, row in df.iterrows():
+            sym = str(row.get('SEM_TRADING_SYMBOL', '')).strip()
+            sec_id = str(row.get('SEM_SMST_SECURITY_ID', '')).strip()
+            segment = str(row.get('SEM_EXM_EXCH_ID', '')).strip()
+            instrument = str(row.get('SEM_SEGMENT', '')).strip()
+
+            if segment == 'NSE' and instrument == 'I':
+                for clean_name, dhan_name in index_alias.items():
+                    if sym.upper() == dhan_name.upper():
+                        symbol_map[clean_name] = {"security_id": sec_id, "exchange_segment": "IDX_I", "instrument_type": "INDEX"}
+            elif segment == 'NSE' and instrument == 'E':
+                clean_sym = sym.replace("-EQ", "").strip()
+                if clean_sym not in symbol_map:
+                    symbol_map[clean_sym] = {"security_id": sec_id, "exchange_segment": "NSE_EQ", "instrument_type": "EQUITY"}
+        return symbol_map
     except Exception:
-        pass
+        return {}
 
-NSE_FNO_FALLBACK = [
-    "NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "TATAMOTORS",
-    "LTIM", "AXISBANK", "KOTAKBANK", "ITC", "LT", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL", "HAL", "COCHINSHIP"
-]
-
-DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-
-def fetch_dhan_fno_universe():
+def analyze_symbol(dhan, symbol, meta_info, interval_min):
     try:
-        df_master = pd.read_csv(DHAN_SCRIP_MASTER_URL, low_memory=False)
-        fno_mask = (
-            (df_master['SEM_EXM_EXCH_ID'].astype(str).str.upper() == 'NSE') & 
-            (df_master['SEM_INSTRUMENT_NAME'].astype(str).str.upper().isin(['FUTSTK', 'OPTSTK']))
+        today = datetime.datetime.now()
+        from_date = (today - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
+        to_date = today.strftime('%Y-%m-%d')
+
+        res = dhan.get_intraday_data(
+            security_id=meta_info['security_id'], exchange_segment=meta_info['exchange_segment'],
+            instrument_type=meta_info['instrument_type'], from_date=from_date, to_date=to_date, interval=str(interval_min)
         )
-        fno_df = df_master[fno_mask]
-        
-        raw_symbols = []
-        if 'SEM_CUSTOM_SYMBOL' in fno_df.columns:
-            raw_symbols = fno_df['SEM_CUSTOM_SYMBOL'].dropna().astype(str).tolist()
-        elif 'SEM_TRADING_SYMBOL' in fno_df.columns:
-            raw_symbols = fno_df['SEM_TRADING_SYMBOL'].dropna().astype(str).tolist()
 
-        indices = {'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT50'}
-        clean_symbols = set(["NIFTY", "BANKNIFTY", "HAL", "COCHINSHIP"])
-        months_regex = r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|CALL|PUT|FUT|CE|PE|\d+).*$'
+        if not isinstance(res, dict) or res.get('status') != 'success' or not res.get('data'):
+            return None
 
-        for raw_sym in raw_symbols:
-            base_part = raw_sym.split('-')[0].upper().strip()
-            clean_sym = re.sub(months_regex, '', base_part)
-            clean_sym = re.sub(r'[^A-Z]', '', clean_sym)
-            
-            if clean_sym and len(clean_sym) >= 2 and clean_sym not in indices:
-                clean_symbols.add(clean_sym)
-                
-        result_list = sorted(list(clean_symbols))
-        return result_list if len(result_list) > 5 else NSE_FNO_FALLBACK
-    except Exception:
-        return NSE_FNO_FALLBACK
+        df = pd.DataFrame(res['data'])
+        if df.empty or len(df) < 25:
+            return None
+        df.columns = [c.lower() for c in df.columns]
 
-def get_dhan_security_id(symbol):
-    try:
-        df_master = pd.read_csv(DHAN_SCRIP_MASTER_URL, low_memory=False)
-        match = df_master[(df_master['SEM_TRADING_SYMBOL'].astype(str).str.upper() == symbol) & (df_master['SEM_EXM_EXCH_ID'].astype(str).str.upper() == 'NSE')]
-        if match.empty:
-            match = df_master[df_master['SEM_CUSTOM_SYMBOL'].astype(str).str.upper() == symbol]
-        if not match.empty:
-            return int(match.iloc[0]['SEM_SECURITY_ID'])
-    except Exception:
-        pass
-    
-    defaults = {"NIFTY": 13, "BANKNIFTY": 25, "RELIANCE": 2885, "TCS": 11536, "HAL": 10940, "COCHINSHIP": 15462}
-    return defaults.get(symbol, 0)
+        # Simple dummy logic for demonstration (replace with your FVG logic)
+        current_price = float(df.iloc[-1]['close'])
+        strike_step = 50 if "NIFTY" in symbol else (100 if "BANK" in symbol else 10)
+        atm_strike = round(current_price / strike_step) * strike_step
 
-def fetch_dhan_live_option_contract_price(symbol, strike, option_type):
-    if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
-        return None
-    sec_id = get_dhan_security_id(symbol)
-    if not sec_id:
-        return None
-    
-    url = "https://api.dhan.co/v2/optionchain"
-    headers = {"access-token": DHAN_ACCESS_TOKEN, "client-id": DHAN_CLIENT_ID, "Content-Type": "application/json"}
-    payload = {
-        "UnderlyingScrip": int(sec_id),
-        "UnderlyingSeg": "IDX_I" if symbol in ["NIFTY", "BANKNIFTY"] else "NSE_EQ"
-    }
-    try:
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
-        if res.status_code == 200:
-            oc_data = res.json().get("data", {}).get("oc", {})
-            strike_keys = list(oc_data.keys())
-            if not strike_keys:
-                return None
-            closest_key = min(strike_keys, key=lambda x: abs(float(x) - float(strike)))
-            if abs(float(closest_key) - float(strike)) <= (20.0 if symbol in ["NIFTY", "BANKNIFTY"] else 15.0):
-                contract_data = oc_data[closest_key].get(option_type.lower(), {})
-                ltp = contract_data.get("last_price", 0.0)
-                if ltp and ltp > 0:
-                    return float(ltp)
-        return None
+        return {
+            "Symbol": symbol, "Signal": "EARLY BUY CE", "Option Strike": f"{atm_strike} CE",
+            "Current Price": round(current_price, 2), "Institutional Entry Zone": f"{current_price-10} - {current_price}",
+            "Tight Stop Loss": round(current_price * 0.996, 2), "Target (1:2.5 RR)": round(current_price * 1.01, 2),
+            "Institutional Setup": "Bullish Retest"
+        }
     except Exception:
         return None
 
-def fetch_dhan_live_option_chain_vol_oi(symbol):
-    if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
-        return None
-    sec_id = get_dhan_security_id(symbol)
-    url = "https://api.dhan.co/v2/optionchain"
-    headers = {"access-token": DHAN_ACCESS_TOKEN, "client-id": DHAN_CLIENT_ID, "Content-Type": "application/json"}
-    payload = {
-        "UnderlyingScrip": int(sec_id) if sec_id else (13 if symbol == "NIFTY" else 25),
-        "UnderlyingSeg": "IDX_I" if symbol in ["NIFTY", "BANKNIFTY"] else "NSE_EQ"
-    }
-    try:
-        res = requests.post(url, json=payload, headers=headers, timeout=4)
-        if res.status_code == 200:
-            oc_data = res.json().get("data", {}).get("oc", {})
-            total_oi = sum([item.get(opt, {}).get("oi", 1) for item in oc_data.values() if isinstance(item, dict) for opt in ['ce', 'pe']])
-            total_vol = sum([item.get(opt, {}).get("volume", 0) for item in oc_data.values() if isinstance(item, dict) for opt in ['ce', 'pe']])
-            return round(total_vol / max(1, total_oi), 2)
-        return None
-    except Exception:
-        return None
+# ==========================================
+# 4. NAVIGATION TABS
+# ==========================================
+tab_scanner, tab_paper = st.tabs(["🎯 Live Scanner", "📄 Paper Trading Desk"])
+scrip_master = fetch_dhan_scrip_master()
 
-def send_telegram_alert(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        res = requests.post(url, json=payload, timeout=5)
-        return res.status_code == 200
-    except Exception:
-        return False
+with tab_scanner:
+    if st.button("🚀 SCAN LIVE INSTITUTIONAL SETUPS"):
+        if not client_id or not access_token:
+            st.warning("Please enter your Dhan API credentials.")
+        else:
+            dhan_client = dhanhq(client_id, access_token)
+            with st.spinner("Scanning markets..."):
+                signals = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = [executor.submit(analyze_symbol, dhan_client, sym, scrip_master[sym], timeframe) 
+                               for sym in FNO_UNIVERSE if sym in scrip_master]
+                    for f in concurrent.futures.as_completed(futures):
+                        if f.result(): signals.append(f.result())
 
-def get_option_contract_pricing(symbol, spot_price, signal, sl_pct=1.5, rr_ratio=2.5):
-    if signal not in ["BUY CE", "BUY PE"]:
-        return "N/A", 0.0, 0.0, 0.0, 0.0
+                if signals:
+                    st.dataframe(pd.DataFrame(signals), use_container_width=True)
+                else:
+                    st.info("No active setups found.")
 
-    step = 50 if symbol == "NIFTY" else (100 if symbol == "BANKNIFTY" else (100 if spot_price > 3000 else (20 if spot_price > 1000 else (10 if spot_price > 500 else 5))))
-    atm_strike = int(round(spot_price / step) * step)
-    option_type = "CE" if "CE" in signal else "PE"
-    strike_label = f"{symbol} {atm_strike} {option_type}"
-
-    live_contract_price = fetch_dhan_live_option_contract_price(symbol, atm_strike, option_type)
-    option_price = round(live_contract_price, 2) if live_contract_price and live_contract_price > 0 else round(spot_price * 0.025, 2)
-
-    option_risk = option_price * (sl_pct / 2.0)
-    option_sl = round(max(0.5, option_price - option_risk), 2)
-    option_target = round(option_price + (option_risk * rr_ratio), 2)
-    option_tsl = round(option_sl + (option_risk * 0.4), 2)
-
-    return strike_label, option_price, option_sl, option_target, option_tsl
-
-def run_scanner():
-    print("🚀 Starting Automated Background Scan...")
-    symbols = fetch_dhan_fno_universe()[:100]
-    
-    yf_tickers = []
-    for sym in symbols:
-        if sym == "NIFTY": yf_tickers.append("^NSEI")
-        elif sym == "BANKNIFTY": yf_tickers.append("^NSEBANK")
-        else: yf_tickers.append(f"{sym}.NS")
-
-    try:
-        data = yf.download(yf_tickers, period="5d", interval="5m", group_by="ticker", progress=False, threads=True)
-    except Exception as e:
-        print(f"Error downloading data: {e}")
-        return
-
-    sent_cache = load_sent_cache()
-    today_str = datetime.now().strftime("%Y-%m-%d")
-
-    for sym in symbols:
-        ticker_id = "^NSEI" if sym == "NIFTY" else ("^NSEBANK" if sym == "BANKNIFTY" else f"{sym}.NS")
-        try:
-            if len(symbols) == 1:
-                df_stock = data.dropna()
-            else:
-                if ticker_id not in data.columns.levels[0]: continue
-                df_stock = data[ticker_id].dropna()
-
-            if len(df_stock) < 30: continue
-
-            close = df_stock['Close']
-            curr_price = float(close.iloc[-1])
-            
-            delta = close.diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / loss
-            rsi_14 = float((100 - (100 / (1 + rs))).iloc[-1])
-            sma_50 = float(close.rolling(50).mean().iloc[-1]) if len(df_stock) >= 50 else float(close.mean())
-
-            last_date = df_stock.index[-1].date()
-            past_df = df_stock[df_stock.index.date < last_date]
-            if not past_df.empty:
-                prev_day_candles = past_df[past_df.index.date == past_df.index.date[-1]]
-                pdh = float(prev_day_candles['High'].max())
-                pdl = float(prev_day_candles['Low'].min())
-            else:
-                pdh = float(df_stock['High'].iloc[0])
-                pdl = float(df_stock['Low'].iloc[0])
-
-            pdh_break = curr_price > pdh and float(close.iloc[-2]) <= pdh
-            pdl_break = curr_price < pdl and float(close.iloc[-2]) >= pdl
-
-            real_vol_oi = fetch_dhan_live_option_chain_vol_oi(sym) or 1.5
-            is_uptrend = curr_price > sma_50
-            is_downtrend = curr_price < sma_50
-            strong_volume = real_vol_oi >= 1.5
-
-            signal = "HOLD"
-            if pdh_break and is_uptrend and strong_volume and (45 <= rsi_14 <= 75):
-                signal = "BUY CE"
-            elif pdl_break and is_downtrend and strong_volume and (25 <= rsi_14 <= 55):
-                signal = "BUY PE"
-
-            if signal in ["BUY CE", "BUY PE"]:
-                alert_key = f"{sym}_{signal}_5m_{today_str}"
-                if alert_key not in sent_cache:
-                    strike, opt_price, opt_sl, opt_target, opt_tsl = get_option_contract_pricing(sym, curr_price, signal)
-                    msg = (
-                        f"🚨 <b>APEX AUTOMATED BACKGROUND ALERT</b> 🚨\n\n"
-                        f"<b>Symbol:</b> #{sym}\n"
-                        f"<b>Signal:</b> {signal}\n"
-                        f"<b>Option Contract:</b> {strike}\n"
-                        f"<b>Live Contract LTP:</b> ₹{opt_price}\n"
-                        f"<b>Stop Loss (SL):</b> ₹{opt_sl}\n"
-                        f"<b>Trailing SL:</b> ₹{opt_tsl}\n"
-                        f"<b>Target (1:2.5 RR):</b> ₹{opt_target}\n"
-                        f"<b>RSI (14):</b> {rsi_14:.1f} | <b>Vol/OI:</b> {real_vol_oi}\n\n"
-                        f"⚡ <i>GitHub Actions Autonomous Daemon</i>"
-                    )
-                    if send_telegram_alert(msg):
-                        sent_cache.add(alert_key)
-                        print(f"Alert sent successfully for {sym} {signal}")
-        except Exception as ex:
-            continue
-
-    save_sent_cache(sent_cache)
-    print("Background Scan Complete.")
-
-if __name__ == "__main__":
-    run_scanner()
+with tab_paper:
+    st.info("Paper trading system goes here.")
